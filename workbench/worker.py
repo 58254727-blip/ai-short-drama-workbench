@@ -6,6 +6,17 @@ from .domain import DomainError, require
 from .queue import KINDS, LIMITS
 
 
+class ProviderFailure(DomainError):
+    """Observed provider outcome used by Worker to preserve GPU fencing."""
+
+    def __init__(self, code: str, message: str, outcome: str, observed_at: str | None = None):
+        super().__init__(code, 502, message)
+        require(outcome in ("preflight", "rejected", "executed_failure", "uncertain"),
+                "invalid_outcome", 500, "外部结果类别无效")
+        self.outcome = outcome
+        self.observed_at = observed_at
+
+
 class Worker:
     def __init__(self, queue, resource: str, handlers: dict):
         require(resource in LIMITS, "invalid_resource", 400, "计算资源不支持")
@@ -42,10 +53,23 @@ class Worker:
         except Exception as error:
             code = error.code if isinstance(error, DomainError) else type(error).__name__
             try:
-                self.queue.fail(job["id"], code, str(error), job["claim_token"])
+                if self.resource == "gpu" and isinstance(error, ProviderFailure):
+                    if error.outcome == "preflight":
+                        self.queue.fail_preflight(job["id"], code, str(error), job["claim_token"])
+                    elif error.outcome == "rejected" and error.observed_at:
+                        self.queue.reject_submission(job["id"], code, str(error), error.observed_at, job["claim_token"])
+                    elif error.outcome == "executed_failure" and error.observed_at:
+                        self.queue.fail(job["id"], code, str(error), job["claim_token"],
+                                        execution_finished_at=error.observed_at)
+                    else:
+                        self.queue.fail(job["id"], code, str(error), job["claim_token"])
+                else:
+                    self.queue.fail(job["id"], code, str(error), job["claim_token"])
             except DomainError as stale:
-                if stale.code != "stale_claim":
+                if stale.code not in ("stale_claim", "invalid_timestamp", "invalid_state", "execution_unverified"):
                     raise
+                if stale.code != "stale_claim":
+                    self.queue.fail(job["id"], code, str(error), job["claim_token"])
         finally:
             done.set()
             pulse.join()
