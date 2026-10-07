@@ -19,12 +19,14 @@ CREATE TABLE IF NOT EXISTS jobs (
  payload TEXT NOT NULL, result TEXT, external_id TEXT, retry_of_id TEXT REFERENCES jobs(id),
  source_revision INTEGER NOT NULL, source_snapshot TEXT NOT NULL, retry_classification TEXT,
  failure_code TEXT, failure_message TEXT,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lease_until TEXT);
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lease_until TEXT,
+ claim_token TEXT, execution_started_at TEXT);
 CREATE INDEX IF NOT EXISTS jobs_ready_idx ON jobs(resource,state,created_at,id);
 CREATE INDEX IF NOT EXISTS jobs_scope_idx ON jobs(project_id,episode_id,shot_id);
 CREATE TABLE IF NOT EXISTS job_phases (
  id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
- phase TEXT NOT NULL, entered_at TEXT NOT NULL, exited_at TEXT, duration_ms INTEGER);
+ phase TEXT NOT NULL, entered_at TEXT NOT NULL, exited_at TEXT, duration_ms INTEGER,
+ interrupted_at TEXT);
 CREATE INDEX IF NOT EXISTS job_phases_job_idx ON job_phases(job_id,id);
 """
 SHELL_KEYS = {"command", "cmd", "shell", "argv", "executable", "subprocess", "script"}
@@ -36,6 +38,16 @@ def _now():
 
 def _stamp(instant=None):
     return (instant or _now()).isoformat()
+
+
+def _observed_utc(value, name):
+    try:
+        instant = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise DomainError("invalid_timestamp", 400, f"{name} 必须是 UTC 时间") from None
+    require(instant.tzinfo is not None and instant.utcoffset() == timedelta(0), "invalid_timestamp", 400, f"{name} 必须是 UTC 时间")
+    require(instant <= _now(), "invalid_timestamp", 400, f"{name} 不得在未来")
+    return instant
 
 
 def _json(value):
@@ -60,6 +72,14 @@ class Queue:
         self.store = store
         with store.transaction() as conn:
             conn.executescript(SCHEMA)
+            for table, additions in (
+                ("jobs", {"claim_token": "TEXT", "execution_started_at": "TEXT"}),
+                ("job_phases", {"interrupted_at": "TEXT"}),
+            ):
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for column, sql_type in additions.items():
+                    if column not in columns:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
     def _row(self, conn, job_id):
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -72,7 +92,7 @@ class Queue:
         item["source_snapshot"] = json.loads(item["source_snapshot"])
         item["result"] = json.loads(item["result"]) if item["result"] is not None else None
         item["phases"] = [dict(phase) for phase in conn.execute(
-            "SELECT phase,entered_at,exited_at,duration_ms FROM job_phases WHERE job_id=? ORDER BY id", (item["id"],)
+            "SELECT phase,entered_at,exited_at,duration_ms,interrupted_at FROM job_phases WHERE job_id=? ORDER BY id", (item["id"],)
         )]
         return item
 
@@ -96,12 +116,16 @@ class Queue:
         return episode["revision"], {"episode": dict(episode), "shot": None}
 
     def _phase(self, conn, job_id, name, when):
-        open_phase = conn.execute("SELECT id,entered_at FROM job_phases WHERE job_id=? AND exited_at IS NULL ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+        open_phase = conn.execute("SELECT id,entered_at FROM job_phases WHERE job_id=? AND exited_at IS NULL AND interrupted_at IS NULL ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
         if open_phase:
             elapsed = max(0, round((when - datetime.fromisoformat(open_phase["entered_at"])).total_seconds() * 1000))
             conn.execute("UPDATE job_phases SET exited_at=?,duration_ms=? WHERE id=?", (_stamp(when), elapsed, open_phase["id"]))
         if name:
             conn.execute("INSERT INTO job_phases(job_id,phase,entered_at) VALUES (?,?,?)", (job_id, name, _stamp(when)))
+
+    def _interrupt_phase(self, conn, job_id, when):
+        conn.execute("UPDATE job_phases SET interrupted_at=? WHERE job_id=? AND exited_at IS NULL AND interrupted_at IS NULL", (_stamp(when), job_id))
+        conn.execute("INSERT INTO job_phases(job_id,phase,entered_at) VALUES (?,?,?)", (job_id, "queued", _stamp(when)))
 
     def _insert(self, conn, scope, kind, payload, source_revision, source_snapshot, retry_of_id=None, retry_classification=None):
         when = _now()
@@ -109,8 +133,9 @@ class Queue:
                     shot_id=scope.get("shot_id"), kind=kind, resource=KINDS[kind], state="queued",
                     payload=_json(payload), result=None, external_id=None, retry_of_id=retry_of_id,
                     source_revision=source_revision, source_snapshot=_json(source_snapshot), retry_classification=retry_classification,
-                    failure_code=None, failure_message=None, created_at=_stamp(when), updated_at=_stamp(when), lease_until=None)
-        conn.execute("INSERT INTO jobs VALUES (:id,:project_id,:episode_id,:shot_id,:kind,:resource,:state,:payload,:result,:external_id,:retry_of_id,:source_revision,:source_snapshot,:retry_classification,:failure_code,:failure_message,:created_at,:updated_at,:lease_until)", item)
+                    failure_code=None, failure_message=None, created_at=_stamp(when), updated_at=_stamp(when), lease_until=None,
+                    claim_token=None, execution_started_at=None)
+        conn.execute("INSERT INTO jobs VALUES (:id,:project_id,:episode_id,:shot_id,:kind,:resource,:state,:payload,:result,:external_id,:retry_of_id,:source_revision,:source_snapshot,:retry_classification,:failure_code,:failure_message,:created_at,:updated_at,:lease_until,:claim_token,:execution_started_at)", item)
         self._phase(conn, item["id"], "queued", when)
         return self._job(conn, self._row(conn, item["id"]))
 
@@ -135,55 +160,91 @@ class Queue:
             when = _now()
             state = "submitting" if resource == "gpu" else "running"
             lease = _stamp(when + timedelta(seconds=60))
-            conn.execute("UPDATE jobs SET state=?,updated_at=?,lease_until=? WHERE id=?", (state, _stamp(when), lease, row["id"]))
+            token = str(uuid4())
+            conn.execute("UPDATE jobs SET state=?,updated_at=?,lease_until=?,claim_token=? WHERE id=?", (state, _stamp(when), lease, token, row["id"]))
             self._phase(conn, row["id"], "preparation" if resource == "gpu" else CPU_PHASES[row["kind"]], when)
             return self._job(conn, self._row(conn, row["id"]))
 
-    def renew_lease(self, job_id: str) -> None:
+    def _owned(self, row, claim_token):
+        require(isinstance(claim_token, str) and row["claim_token"] == claim_token and row["lease_until"] is not None and
+                datetime.fromisoformat(row["lease_until"]) > _now(), "stale_claim", 409, "任务领取已失效")
+
+    def renew_lease(self, job_id: str, claim_token: str) -> None:
         with self.store.transaction() as conn:
             row = self._row(conn, job_id)
-            require(row["state"] in ("submitting", "running"), "invalid_state", 409, "任务未运行")
+            self._owned(row, claim_token)
+            require(row["state"] in BUSY, "invalid_state", 409, "任务未运行或待核对")
             conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", (_stamp(_now() + timedelta(seconds=60)), job_id))
 
-    def record_external(self, job_id: str, external_id: str) -> None:
+    def record_external(self, job_id: str, external_id: str, claim_token: str) -> None:
         require(isinstance(external_id, str) and bool(external_id.strip()), "invalid_external_id", 400, "外部任务 ID 不能为空")
         with self.store.transaction() as conn:
             row = self._row(conn, job_id)
-            require(row["resource"] == "gpu" and row["state"] in ("submitting", "needs_reconcile") and row["external_id"] is None, "invalid_state", 409, "任务不在可核对状态")
+            self._owned(row, claim_token)
+            require(row["resource"] == "gpu" and row["state"] in ("submitting", "needs_reconcile"), "invalid_state", 409, "任务不在可核对状态")
+            if row["external_id"] == external_id:
+                return
+            require(row["external_id"] is None, "external_conflict", 409, "外部任务 ID 已记录")
             when = _now()
-            conn.execute("UPDATE jobs SET external_id=?,state='running',updated_at=? WHERE id=?", (external_id, _stamp(when), job_id))
-            self._phase(conn, job_id, "gpu_execution", when)
+            conn.execute("UPDATE jobs SET external_id=?,updated_at=? WHERE id=?", (external_id, _stamp(when), job_id))
 
-    def _terminal(self, job_id, state, result=None, code=None, message=None):
+    def record_execution_started(self, job_id: str, started_at: str, claim_token: str) -> None:
+        observed = _observed_utc(started_at, "执行开始")
         with self.store.transaction() as conn:
             row = self._row(conn, job_id)
+            self._owned(row, claim_token)
+            require(row["resource"] == "gpu" and row["external_id"] is not None and row["state"] in ("submitting", "needs_reconcile", "running"), "invalid_state", 409, "GPU 任务尚无外部执行证据")
+            if row["execution_started_at"] is not None:
+                require(datetime.fromisoformat(row["execution_started_at"]) == observed, "execution_conflict", 409, "执行开始时间冲突")
+                if row["state"] == "needs_reconcile":
+                    conn.execute("UPDATE jobs SET state='running',updated_at=? WHERE id=?", (_stamp(), job_id))
+                return
+            opened = conn.execute("SELECT entered_at FROM job_phases WHERE job_id=? AND exited_at IS NULL AND interrupted_at IS NULL ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+            require(opened is not None and observed >= datetime.fromisoformat(opened["entered_at"]), "invalid_timestamp", 400, "执行开始早于领取")
+            conn.execute("UPDATE jobs SET state='running',execution_started_at=?,updated_at=? WHERE id=?", (_stamp(observed), _stamp(), job_id))
+            self._phase(conn, job_id, "gpu_execution", observed)
+
+    def _terminal(self, job_id, state, claim_token, result=None, code=None, message=None, execution_finished_at=None):
+        with self.store.transaction() as conn:
+            row = self._row(conn, job_id)
+            self._owned(row, claim_token)
             require(row["state"] in BUSY, "invalid_state", 409, "任务无法完成")
             when = _now()
-            conn.execute("UPDATE jobs SET state=?,result=?,failure_code=?,failure_message=?,lease_until=NULL,updated_at=? WHERE id=?",
-                         (state, _json(result) if result is not None else None, code, message, _stamp(when), job_id))
+            if state == "succeeded" and row["resource"] == "gpu":
+                require(row["state"] == "running" and row["external_id"] is not None and row["execution_started_at"] is not None,
+                        "execution_unverified", 409, "GPU 执行未核实完成")
+                require(execution_finished_at is not None, "execution_unverified", 409, "缺少外部执行结束时间")
+                when = _observed_utc(execution_finished_at, "执行结束")
+                require(when >= datetime.fromisoformat(row["execution_started_at"]), "invalid_timestamp", 400, "执行结束早于开始")
+            conn.execute("UPDATE jobs SET state=?,result=?,failure_code=?,failure_message=?,lease_until=NULL,claim_token=NULL,updated_at=? WHERE id=?",
+                         (state, _json(result) if result is not None else None, code, message, _stamp(), job_id))
             self._phase(conn, job_id, None, when)
 
-    def finish(self, job_id: str, result: dict) -> None:
+    def finish(self, job_id: str, result: dict, claim_token: str, *, execution_finished_at: str | None = None) -> None:
         require(isinstance(result, dict), "invalid_result", 400, "任务结果必须是对象")
-        self._terminal(job_id, "succeeded", result=result)
+        self._terminal(job_id, "succeeded", claim_token, result=result, execution_finished_at=execution_finished_at)
 
-    def fail(self, job_id: str, code: str, message: str) -> None:
+    def fail(self, job_id: str, code: str, message: str, claim_token: str) -> None:
         require(isinstance(code, str) and bool(code.strip()) and isinstance(message, str), "invalid_failure", 400, "失败分类或原因错误")
-        self._terminal(job_id, "failed", code=code, message=message)
+        self._terminal(job_id, "failed", claim_token, code=code, message=message)
 
     def recover(self) -> list[dict]:
         """Call at startup; uncertain GPU submissions remain reserved for external reconciliation."""
         with self.store.transaction() as conn:
-            rows = conn.execute("SELECT * FROM jobs WHERE state IN ('submitting','running') ORDER BY created_at,id").fetchall()
+            rows = conn.execute("SELECT * FROM jobs WHERE state IN ('submitting','running','needs_reconcile') AND lease_until IS NOT NULL AND lease_until<=? ORDER BY created_at,id", (_stamp(),)).fetchall()
             result = []
             for row in rows:
                 when = _now()
-                if row["resource"] == "gpu" or row["external_id"] is not None:
-                    state, phase = "needs_reconcile", "needs_reconcile"
+                idempotent_local = row["kind"] in ("probe", "asr", "export") and json.loads(row["payload"]).get("idempotent_local") is True
+                if row["resource"] == "gpu" or row["external_id"] is not None or not idempotent_local:
+                    state, phase = "needs_reconcile", None
                 else:
                     state, phase = "queued", "queued"
-                conn.execute("UPDATE jobs SET state=?,updated_at=?,lease_until=NULL WHERE id=?", (state, _stamp(when), row["id"]))
-                self._phase(conn, row["id"], phase, when)
+                conn.execute("UPDATE jobs SET state=?,updated_at=?,lease_until=?,claim_token=? WHERE id=?",
+                             (state, _stamp(when), _stamp(when + timedelta(seconds=60)) if state == "needs_reconcile" else None,
+                              str(uuid4()) if state == "needs_reconcile" else None, row["id"]))
+                if phase is not None:
+                    self._interrupt_phase(conn, row["id"], when)
                 result.append(self._job(conn, self._row(conn, row["id"])))
             return result
 
@@ -217,8 +278,8 @@ class Queue:
             _check_no_shell(new_payload)
             _json(new_payload)
             require(new_payload.get("plan_revision") is not None and new_payload.get("strategy") is not None, "invalid_payload", 400, "重试须记录方案版本和策略")
-            prior = conn.execute("SELECT payload,failure_code FROM jobs WHERE shot_id IS ? AND kind=? AND source_revision=? AND state='failed'",
-                                 (old["shot_id"], old["kind"], old["source_revision"]))
+            prior = conn.execute("SELECT payload,failure_code FROM jobs WHERE project_id=? AND episode_id=? AND shot_id IS ? AND kind=? AND source_revision=? AND source_snapshot=? AND state='failed'",
+                                 (old["project_id"], old["episode_id"], old["shot_id"], old["kind"], old["source_revision"], old["source_snapshot"]))
             equivalent_failures = sum(1 for row in prior if row["failure_code"] == old["failure_code"] and
                                       json.loads(row["payload"]).get("plan_revision") == new_payload["plan_revision"] and
                                       json.loads(row["payload"]).get("strategy") == new_payload["strategy"])

@@ -25,7 +25,7 @@ class Worker:
         def heartbeat():
             while not done.wait(20):
                 try:
-                    self.queue.renew_lease(job["id"])
+                    self.queue.renew_lease(job["id"], job["claim_token"])
                 except DomainError:
                     return
 
@@ -37,10 +37,15 @@ class Worker:
                 raise DomainError("handler_missing", 503, "任务处理器未配置")
             result = handler(job["kind"], job)
             require(isinstance(result, dict), "invalid_result", 500, "任务处理器结果必须是对象")
-            self.queue.finish(job["id"], result)
+            self.queue.finish(job["id"], result, job["claim_token"],
+                              execution_finished_at=result.get("execution_finished_at") if self.resource == "gpu" else None)
         except Exception as error:
             code = error.code if isinstance(error, DomainError) else type(error).__name__
-            self.queue.fail(job["id"], code, str(error))
+            try:
+                self.queue.fail(job["id"], code, str(error), job["claim_token"])
+            except DomainError as stale:
+                if stale.code != "stale_claim":
+                    raise
         finally:
             done.set()
             pulse.join()
