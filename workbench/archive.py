@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from .assets import binary_available
+from .archive_extensions import EXT_TABLES, collect_extensions, init_extensions, validate_extensions
 from .domain import DomainError, require
 from .store import Store
 
@@ -40,6 +41,7 @@ def _hash_archive(path):
 
 def archive_project(store: Store, project_id: str, destination: Path) -> dict:
     bundle = store.export_project(project_id)
+    bundle["extensions"] = collect_extensions(store, project_id)
     destination = Path(destination)
     require(not destination.exists() and not destination.is_symlink(), "archive_conflict", 409, "归档已存在")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +129,12 @@ def restore_archive(store: Store, source: Path) -> dict:
         with tempfile.TemporaryDirectory(prefix=".archive-validate-") as trial:
             verified_store = Store(Path(trial) / "verify.sqlite", Path(trial))
             verified_store.restore_project(bundle)
+            extension = bundle.get("extensions")
+            if extension is None:
+                init_extensions(verified_store)
+                extension_rows = {table: [] for table in EXT_TABLES}
+            else:
+                extension_rows = validate_extensions(verified_store, extension, bundle["project"]["id"])
             with verified_store.connection() as source_conn:
                 validated_rows = {table: [dict(row) for row in source_conn.execute(f"SELECT * FROM {table}")] for table in TABLES}
         _verify_binaries(archive, assets)
@@ -166,6 +174,7 @@ def restore_archive(store: Store, source: Path) -> dict:
                 finally:
                     Path(temporary).unlink(missing_ok=True)
             # Reuse the validated rows and attach immutable hashes within one transaction.
+            init_extensions(store)
             with store.transaction() as conn:
                 for table in TABLES:
                     for row in validated_rows[table]:
@@ -175,6 +184,10 @@ def restore_archive(store: Store, source: Path) -> dict:
                         columns = list(record)
                         placeholders = ",".join("?" for _ in columns)
                         conn.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders})", list(record.values()))
+                for table in EXT_TABLES:
+                    for row in extension_rows[table]:
+                        columns = list(row)
+                        conn.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", list(row.values()))
         except (sqlite3.IntegrityError, OSError, DomainError) as exc:
             for path in created:
                 path.unlink(missing_ok=True)

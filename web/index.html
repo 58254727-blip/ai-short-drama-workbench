@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#12171b">
+  <title>镜序｜本地工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">镜序</div>
+    <label class="compact">作品 <select id="project-select" aria-label="选择作品"></select></label>
+    <label class="compact">分集 <select id="episode-select" aria-label="选择分集"></select></label>
+    <button id="settings-button" class="top-settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 2h4l.7 2.2 2 .9 2.1-1 2.8 2.8-1 2.1.9 2L24 11v4l-2.5.7-.9 2 1 2.1-2.8 2.8-2.1-1-2 .9L14 25h-4l-.7-2.5-2-.9-2.1 1-2.8-2.8 1-2.1-.9-2L0 15v-4l2.5-.7.9-2-1-2.1 2.8-2.8 2.1 1 2-.9L10 2Z" transform="translate(1 -1) scale(.9)"/><circle cx="12" cy="12" r="3.2"/></svg>设置</button>
+  </header>
+  <div class="shell">
+    <nav class="sidebar" aria-label="工作区">
+      <button data-view="director"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 2h9l5 5v15H5zM14 2v5h5M8 11h8M8 15h8"/></svg>编导</button>
+      <button data-view="shots" class="selected"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M8 3v18M16 3v18M3 8h5M3 16h5M16 8h5M16 16h5"/></svg>分镜</button>
+      <button data-view="assets"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 5h7l2 2h11v13H2z"/></svg>素材</button>
+      <button data-view="jobs"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 12 3 3 7-7"/></svg>任务</button>
+      <button data-view="review"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 21 6v6c0 5-4 8-9 10-5-2-9-5-9-10V6z"/><path d="m8 12 3 3 5-6"/></svg>校核</button>
+      <button data-view="export"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V2m0 0-4 4m4-4 4 4M4 14v7h16v-7"/></svg>导出</button>
+    </nav>
+    <main id="workspace" tabindex="-1"><div class="loading">正在读取本地工作台…</div></main>
+  </div>
+  <footer class="statusbar"><span>本地工作台</span><span id="status-text">尚未提交生成任务</span><span id="notice" role="status" aria-live="polite"></span></footer>
+  <dialog id="create-dialog">
+    <form method="dialog" id="create-form">
+      <h2 id="create-title">新建</h2>
+      <label>名称 <input id="create-name" required maxlength="100"></label>
+      <div class="dialog-actions"><button id="create-cancel" type="button" class="quiet">取消</button><button id="create-submit" value="save" class="primary">创建</button></div>
+    </form>
+  </dialog>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

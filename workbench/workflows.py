@@ -1,6 +1,7 @@
 """Explicit workflow bindings and scoped H3 job handler."""
 
 import copy
+import hashlib
 import os
 import tempfile
 import time
@@ -121,6 +122,35 @@ def _media_kind(filename: str, content: bytes) -> str:
     return kind
 
 
+def collect_candidates(store, job, prompt_id, files):
+    """Register observed outputs once; repeated reconciliation reuses matching versions."""
+    candidates = []
+    staging = store.data_root / "staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    existing = store.list_assets(job["project_id"])
+    for file in files:
+        kind = _media_kind(file["filename"], file["content"])
+        sha = hashlib.sha256(file["content"]).hexdigest()
+        prior = next((asset for asset in existing if asset["sha256"] == sha and asset["rights"].get("job_id") == job["id"] and asset["rights"].get("prompt_id") == prompt_id), None)
+        if prior:
+            candidates.append(prior)
+            continue
+        suffix = Path(file["filename"]).suffix.lower()
+        fd, path = tempfile.mkstemp(prefix="comfy-", suffix=suffix, dir=staging)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(file["content"])
+            asset = store.import_asset(job["project_id"], Path(path), kind,
+                                       {"source": "comfy", "job_id": job["id"], "prompt_id": prompt_id,
+                                        "episode_id": job["episode_id"], "shot_id": job["shot_id"],
+                                        "status": "candidate", "media_qc": "pending_decode"})
+            candidates.append(asset)
+            existing.append(asset)
+        finally:
+            Path(path).unlink(missing_ok=True)
+    return candidates
+
+
 def make_h3_handler(queue, store, adapter, workflow: dict, bindings: dict, *,
                     first_frame_binding: str | None = None, poll_interval_s: float = 1,
                     max_wait_s: float = 300):
@@ -173,24 +203,7 @@ def make_h3_handler(queue, store, adapter, workflow: dict, bindings: dict, *,
                     require(state["started_at"] and state["finished_at"], "execution_uncertain", 503,
                             "成功状态缺少完整时间证据")
                     files = adapter.collect(prompt_id)
-                    candidates = []
-                    staging = store.data_root / "staging"
-                    staging.mkdir(parents=True, exist_ok=True)
-                    for file in files:
-                        suffix = Path(file["filename"]).suffix.lower()
-                        kind = _media_kind(file["filename"], file["content"])
-                        fd, path = tempfile.mkstemp(prefix="comfy-", suffix=suffix, dir=staging)
-                        try:
-                            with os.fdopen(fd, "wb") as stream:
-                                stream.write(file["content"])
-                            asset = store.import_asset(job["project_id"], Path(path), kind,
-                                                       {"source": "comfy", "job_id": job_id,
-                                                        "prompt_id": prompt_id, "episode_id": job["episode_id"],
-                                                        "shot_id": job["shot_id"], "status": "candidate",
-                                                        "media_qc": "pending_decode"})
-                            candidates.append(asset)
-                        finally:
-                            Path(path).unlink(missing_ok=True)
+                    candidates = collect_candidates(store, job, prompt_id, files)
                     return {"prompt_id": prompt_id, "candidate_assets": candidates,
                             "execution_finished_at": state["finished_at"]}
                 if time.monotonic() >= deadline:

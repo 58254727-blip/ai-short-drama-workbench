@@ -51,8 +51,8 @@ def export_episode(scope: dict, timeline: list[dict], subtitle_path: Path | None
         require(info["sha256"] == asset["sha256"], "asset_hash_mismatch", 409, "素材哈希变化")
         require(info["has_audio"], "audio_missing", 422, "源视频缺少原音轨，需人工处理")
         require(type(start) is int and type(end) is int and 0 <= start < end <= info["duration_ms"], "invalid_cut", 400, "切点超出源视频")
-        if "speech_start_ms" in item or "speech_end_ms" in item:
-            require("speech_start_ms" in item and "speech_end_ms" in item, "invalid_speech_range", 400, "对白范围必须有起止")
+        if item.get("speech_start_ms") is not None or item.get("speech_end_ms") is not None:
+            require(item.get("speech_start_ms") is not None and item.get("speech_end_ms") is not None, "invalid_speech_range", 400, "对白范围必须有起止")
             _speech_guard(start, end, [(item["speech_start_ms"], item["speech_end_ms"])])
         checked = decode_check(source, data_root=root)
         require(checked["decoded"], "decode_failed", 422, checked["errors"])
