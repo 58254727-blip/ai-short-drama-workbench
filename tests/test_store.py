@@ -1,5 +1,8 @@
+import sqlite3
 import tempfile
+import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from workbench.domain import DomainError
@@ -90,6 +93,49 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(DomainError):
             other.restore_project(bundle)
         self.assertEqual([], other.list_projects())
+
+    def test_export_reads_one_sqlite_snapshot_while_writer_commits(self):
+        project = self.store.create_project("旧标题")
+        episode = self.store.create_episode(project["id"], "一")
+        self.store.update_episode(episode["id"], {"script": "旧稿"}, episode["revision"])
+        with closing(sqlite3.connect(self.store.db_path)) as conn:
+            self.assertEqual("wal", conn.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+        read_started = threading.Event()
+        writer_done = threading.Event()
+
+        class PausingStore(Store):
+            def _row(self, conn, table, identifier):
+                row = super()._row(conn, table, identifier)
+                if getattr(self, "pause_export", False) and table == "projects":
+                    self.pause_export = False
+                    read_started.set()
+                    if not writer_done.wait(3):
+                        raise AssertionError("writer did not commit while export was paused")
+                return row
+
+        def write_new_version():
+            if not read_started.wait(3):
+                writer_done.set()
+                return
+            try:
+                with self.store.transaction() as conn:
+                    conn.execute("UPDATE projects SET title='新标题' WHERE id=?", (project["id"],))
+                    conn.execute("UPDATE episodes SET script='新稿' WHERE id=?", (episode["id"],))
+            finally:
+                writer_done.set()
+
+        exporter = PausingStore(self.store.db_path)
+        exporter.pause_export = True
+        worker = threading.Thread(target=write_new_version)
+        worker.start()
+        try:
+            bundle = exporter.export_project(project["id"])
+        finally:
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual("新标题", self.store.get_project(project["id"])["title"])
+        self.assertEqual("旧标题", bundle["project"]["title"])
+        self.assertEqual("旧稿", bundle["episodes"][0]["script"])
 
 
 if __name__ == "__main__":

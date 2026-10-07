@@ -34,6 +34,46 @@ class AssetTests(unittest.TestCase):
         self.assertEqual(first["id"], self.store.get_shot(self.shot["id"])["selected_candidate_id"])
         self.assertEqual(selected["revision"], self.store.get_shot(self.shot["id"])["revision"])
 
+    def test_corrupted_content_address_is_not_reused_or_reported_available(self):
+        body = b"clean-content"
+        source = self.source(body=body)
+        digest = hashlib.sha256(body).hexdigest()
+        target = self.root / "assets" / digest
+        target.parent.mkdir()
+        target.write_bytes(b"corrupt-bytes")
+        with self.assertRaises(DomainError):
+            self.store.import_asset(self.project["id"], source, "video", {})
+        self.assertEqual(b"corrupt-bytes", target.read_bytes())
+        self.assertEqual([], self.store.list_assets(self.project["id"]))
+        target.write_bytes(body)
+        record = self.store.import_asset(self.project["id"], source, "video", {})
+        self.assertTrue(self.store.get_asset(record["id"])["binary_available"])
+        target.write_bytes(b"tampered-data")
+        self.assertFalse(self.store.get_asset(record["id"])["binary_available"])
+
+    def test_destination_symlink_cannot_be_reused(self):
+        body = b"safe-content"
+        source = self.source(body=body)
+        digest = hashlib.sha256(body).hexdigest()
+        target = self.root / "assets" / digest
+        target.parent.mkdir()
+        outside = self.root / "outside.bin"
+        outside.write_bytes(body)
+        try:
+            target.symlink_to(outside)
+        except OSError:
+            self.skipTest("file symlinks unavailable")
+        with self.assertRaises(DomainError):
+            self.store.import_asset(self.project["id"], source, "video", {})
+        self.assertEqual(b"safe-content", outside.read_bytes())
+        self.assertEqual([], self.store.list_assets(self.project["id"]))
+
+    def test_non_json_rights_are_domain_error_without_asset_record(self):
+        with self.assertRaises(DomainError) as caught:
+            self.store.import_asset(self.project["id"], self.source(), "video", {"bad": {1, 2}})
+        self.assertEqual(400, caught.exception.status)
+        self.assertEqual([], self.store.list_assets(self.project["id"]))
+
     def test_external_missing_symlink_and_foreign_asset_rejected(self):
         outside = self.root / "external.bin"
         outside.write_bytes(b"bad")
