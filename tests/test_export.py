@@ -5,11 +5,15 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from workbench.archive import archive_project, restore_archive
+from workbench import archive as archive_module
+from workbench import exporter as exporter_module
 from workbench.domain import DomainError
 from workbench.exporter import _static_suspected, export_episode
 from workbench.media import decode_check, probe
@@ -125,6 +129,73 @@ class ExportTests(unittest.TestCase):
             restore_archive(restored, archive)
         self.assertEqual(restored.list_projects(), [])
         self.assertFalse((target / "assets").exists())
+
+    def test_aggregate_uncompressed_budget_rejects_without_records_or_files(self):
+        archive = self.root / "budget.zip"
+        archive_project(self.store, self.project["id"], archive)
+        target = self.root / "budget target"
+        target.mkdir()
+        restored = Store(target / "workbench.sqlite", target)
+        with patch.object(archive_module, "MAX_TOTAL_UNCOMPRESSED_BYTES", 100, create=True):
+            with self.assertRaises(DomainError):
+                restore_archive(restored, archive)
+        self.assertEqual(restored.list_projects(), [])
+        self.assertFalse((target / "assets").exists())
+
+    def test_source_changes_during_archive_write_never_publishes_zip(self):
+        destination = self.root / "raced.zip"
+        original_write = zipfile.ZipFile.write
+        changed = False
+
+        def changed_write(z, filename, arcname=None, *args, **kwargs):
+            nonlocal changed
+            if arcname and arcname.startswith("assets/") and not changed:
+                changed = True
+                Path(filename).write_bytes(b"changed during packaging")
+            return original_write(z, filename, arcname, *args, **kwargs)
+
+        with patch.object(zipfile.ZipFile, "write", changed_write):
+            with self.assertRaises(DomainError):
+                archive_project(self.store, self.project["id"], destination)
+        self.assertFalse(destination.exists())
+
+    def test_two_exports_same_path_preserve_first_success(self):
+        destination = self.scope()["output_path"]
+        reached = threading.Barrier(2)
+        first_done = threading.Event()
+        local = threading.local()
+        real_run = exporter_module._run
+        results = [None, None]
+
+        def controlled_run(args, timeout=180):
+            if "-filter_complex" in args:
+                reached.wait(timeout=15)
+                if local.index == 1:
+                    self.assertTrue(first_done.wait(15))
+            return real_run(args, timeout=timeout)
+
+        def worker(index):
+            local.index = index
+            try:
+                results[index] = export_episode(self.scope(), self.timeline(), None)
+            except DomainError as error:
+                results[index] = error
+            finally:
+                if index == 0:
+                    first_done.set()
+
+        with patch.object(exporter_module, "_run", controlled_run):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertIsInstance(results[0], dict)
+        self.assertIsInstance(results[1], DomainError)
+        self.assertEqual(results[1].code, "output_conflict")
+        self.assertTrue(destination.exists())
+        self.assertEqual(results[0]["sha256"], hashlib.sha256(destination.read_bytes()).hexdigest())
 
 
 if __name__ == "__main__":

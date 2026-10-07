@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from fractions import Fraction
 from pathlib import Path
 
@@ -51,6 +52,26 @@ def _sha(path):
     return digest.hexdigest()
 
 
+def _temporary_output(destination, data_root):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".media-", suffix=destination.suffix or ".mp4", dir=destination.parent)
+    os.close(fd)
+    temporary = Path(name)
+    try:
+        _path(temporary, data_root)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def _publish_output(temporary, destination):
+    try:
+        os.link(temporary, destination)
+    except FileExistsError:
+        raise DomainError("output_conflict", 409, "输出文件已存在") from None
+
+
 def probe(path: Path, *, data_root: Path) -> dict:
     source = _path(path, data_root)
     result = _run([_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration:stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,nb_frames,time_base,sample_rate,channels", "-of", "json", str(source)], timeout=30)
@@ -89,15 +110,17 @@ def trim(source: Path, in_ms: int, out_ms: int, dest: Path, *, data_root: Path, 
     info = probe(source, data_root=data_root)
     require(type(in_ms) is int and type(out_ms) is int and 0 <= in_ms < out_ms <= info["duration_ms"], "invalid_cut", 400, "剪辑范围超出实际片长")
     _speech_guard(in_ms, out_ms, speech_ranges)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    args = [_tool("ffmpeg"), "-v", "error", "-i", str(source), "-ss", f"{in_ms/1000:.3f}", "-t", f"{(out_ms-in_ms)/1000:.3f}", "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", str(destination)]
-    result = _run(args)
-    if result.returncode != 0:
-        destination.unlink(missing_ok=True)
-        raise DomainError("trim_failed", 502, result.stderr[-1000:])
-    checked = decode_check(destination, data_root=data_root)
-    if not checked["decoded"]:
-        destination.unlink(missing_ok=True)
-        raise DomainError("decode_failed", 422, checked["errors"])
-    output = probe(destination, data_root=data_root)
-    return {**output, **checked, "method": "reencode", "source_sha256": info["sha256"], "human_reviewed": False}
+    temporary = _temporary_output(destination, data_root)
+    try:
+        args = [_tool("ffmpeg"), "-v", "error", "-i", str(source), "-ss", f"{in_ms/1000:.3f}", "-t", f"{(out_ms-in_ms)/1000:.3f}", "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", str(temporary)]
+        result = _run(args)
+        if result.returncode != 0:
+            raise DomainError("trim_failed", 502, result.stderr[-1000:])
+        checked = decode_check(temporary, data_root=data_root)
+        if not checked["decoded"]:
+            raise DomainError("decode_failed", 422, checked["errors"])
+        output = probe(temporary, data_root=data_root)
+        _publish_output(temporary, destination)
+        return {**output, "path": str(destination), **checked, "method": "reencode", "source_sha256": info["sha256"], "human_reviewed": False}
+    finally:
+        temporary.unlink(missing_ok=True)

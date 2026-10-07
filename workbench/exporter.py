@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .assets import binary_available
 from .domain import DomainError, require
-from .media import _path, _run, _sha, _speech_guard, _tool, decode_check, probe
+from .media import _path, _publish_output, _run, _speech_guard, _temporary_output, _tool, decode_check, probe
 
 
 def _static_suspected(path, root):
@@ -57,7 +57,14 @@ def export_episode(scope: dict, timeline: list[dict], subtitle_path: Path | None
         checked = decode_check(source, data_root=root)
         require(checked["decoded"], "decode_failed", 422, checked["errors"])
         validated.append((source, start, end, asset["sha256"], _static_suspected(source, root)))
-    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_output(output, root)
+    try:
+        return _render(validated, subtitle, width, height, fps, temporary, output, root)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _render(validated, subtitle, width, height, fps, temporary, output, root):
     args = [_tool("ffmpeg"), "-v", "error"]
     for source, _, _, _, _ in validated:
         args += ["-i", str(source)]
@@ -73,14 +80,13 @@ def export_episode(scope: dict, timeline: list[dict], subtitle_path: Path | None
     args += ["-filter_complex", ";".join(filters), "-map", "[v]", "-map", "[a]"]
     if subtitle is not None:
         args += ["-map", f"{len(validated)}:s:0", "-c:s", "mov_text"]
-    args += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", "-y", str(output)]
+    args += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", "-y", str(temporary)]
     result = _run(args, timeout=600)
     if result.returncode:
-        output.unlink(missing_ok=True)
         raise DomainError("export_failed", 502, result.stderr[-2000:])
-    checked = decode_check(output, data_root=root)
+    checked = decode_check(temporary, data_root=root)
     if not checked["decoded"]:
-        output.unlink(missing_ok=True)
         raise DomainError("decode_failed", 422, checked["errors"])
-    actual = probe(output, data_root=root)
-    return {**actual, **checked, "method": "reencode_concat", "source_versions": [entry[3] for entry in validated], "static_review_flags": [entry[4] for entry in validated], "subtitle_included": subtitle is not None, "human_reviewed": False, "machine_qc": "decoded", "review_pending": ["画面内容", "对白听审", "表演与连续性", "字幕校对"]}
+    actual = probe(temporary, data_root=root)
+    _publish_output(temporary, output)
+    return {**actual, "path": str(output), **checked, "method": "reencode_concat", "source_versions": [entry[3] for entry in validated], "static_review_flags": [entry[4] for entry in validated], "subtitle_included": subtitle is not None, "human_reviewed": False, "machine_qc": "decoded", "review_pending": ["画面内容", "对白听审", "表演与连续性", "字幕校对"]}
