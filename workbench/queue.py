@@ -265,13 +265,19 @@ class Queue:
         with self.store.transaction() as conn:
             row = self._row(conn, job_id)
             self._owned(row, claim_token)
+            legacy_known_external = row["state"] == "needs_reconcile" and row["external_id"] is not None and row["submission_attempted_at"] is None
             require(row["resource"] == "gpu" and row["state"] in ("submitting", "needs_reconcile") and
-                    row["submission_attempted_at"] is not None and row["execution_started_at"] is None,
+                    (row["submission_attempted_at"] is not None or legacy_known_external) and row["execution_started_at"] is None,
                     "invalid_state", 409, "没有未执行的提交拒绝证据")
-            require(observed >= datetime.fromisoformat(row["submission_attempted_at"]), "invalid_timestamp", 400, "拒绝时间早于提交")
+            lower_bound = row["submission_attempted_at"] or row["created_at"]
+            require(observed >= datetime.fromisoformat(lower_bound), "invalid_timestamp", 400, "拒绝时间早于任务创建或提交")
             conn.execute("UPDATE jobs SET state='failed',failure_code=?,failure_message=?,claim_token=NULL,lease_until=NULL,updated_at=? WHERE id=?",
                          (code, message, _stamp(), job_id))
-            self._phase(conn, job_id, None, observed)
+            if legacy_known_external:
+                conn.execute("UPDATE job_phases SET interrupted_at=? WHERE job_id=? AND exited_at IS NULL AND interrupted_at IS NULL",
+                             (_stamp(observed), job_id))
+            else:
+                self._phase(conn, job_id, None, observed)
 
     def recover(self) -> list[dict]:
         """Call at startup; uncertain GPU submissions remain reserved for external reconciliation."""

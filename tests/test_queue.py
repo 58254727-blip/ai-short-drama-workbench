@@ -3,8 +3,10 @@
 import tempfile
 import threading
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from workbench.domain import DomainError
 from workbench.queue import Queue
@@ -427,6 +429,47 @@ class QueueTests(unittest.TestCase):
         job = upgraded.enqueue({"project_id": project["id"], "episode_id": episode["id"]}, "probe", {})
         self.assertIn("claim_token", upgraded.claim("cpu"))
         self.assertEqual(job["id"], upgraded.list_jobs()[0]["id"])
+
+    def test_legacy_submitted_gpu_releases_only_after_provider_rejection_evidence(self):
+        legacy_store = Store(Path(self.temp.name) / "legacy_gpu.sqlite")
+        project = legacy_store.create_project("old")
+        episode = legacy_store.create_episode(project["id"], "old")
+        old_id = str(uuid4())
+        created = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        with legacy_store.connection() as conn:
+            conn.executescript("""
+                CREATE TABLE jobs (id TEXT PRIMARY KEY, project_id TEXT, episode_id TEXT, shot_id TEXT,
+                  kind TEXT, resource TEXT, state TEXT, payload TEXT, result TEXT, external_id TEXT,
+                  retry_of_id TEXT, source_revision INTEGER, source_snapshot TEXT, retry_classification TEXT,
+                  failure_code TEXT, failure_message TEXT, created_at TEXT, updated_at TEXT, lease_until TEXT);
+                CREATE TABLE job_phases (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT,
+                  phase TEXT, entered_at TEXT, exited_at TEXT, duration_ms INTEGER);
+            """)
+            conn.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                old_id, project["id"], episode["id"], None, "h3", "gpu", "running", "{}", None,
+                "legacy-provider-id", None, 1, json.dumps({"episode": episode, "shot": None}), None,
+                None, None, created, created, expired,
+            ))
+            conn.execute("INSERT INTO job_phases(job_id,phase,entered_at) VALUES (?,?,?)", (old_id, "gpu_execution", created))
+            conn.commit()
+        queue = Queue(legacy_store)
+        next_job = queue.enqueue({"project_id": project["id"], "episode_id": episode["id"]}, "h3", {})
+        recovered = queue.recover()
+        self.assertEqual([old_id], [job["id"] for job in recovered])
+        self.assertIsNone(recovered[0]["submission_attempted_at"])
+        self.assertEqual("needs_reconcile", recovered[0]["state"])
+        queue.fail(old_id, "timeout", "no terminal evidence", recovered[0]["claim_token"])
+        self.assertIsNone(queue.claim("gpu"))
+        self.assertIsNone(queue.get_job(old_id)["phases"][-1]["exited_at"])
+        token = queue.get_job(old_id)["claim_token"]
+        rejected_at = datetime.now(timezone.utc).isoformat()
+        queue.reject_submission(old_id, "rejected", "provider confirmed no execution", rejected_at, token)
+        self.assertEqual("failed", queue.get_job(old_id)["state"])
+        self.assertIsNone(queue.get_job(old_id)["phases"][-1]["exited_at"])
+        self.assertIsNone(queue.get_job(old_id)["phases"][-1]["duration_ms"])
+        self.assertEqual(rejected_at, queue.get_job(old_id)["phases"][-1]["interrupted_at"])
+        self.assertEqual(next_job["id"], queue.claim("gpu")["id"])
 
 
 if __name__ == "__main__":
