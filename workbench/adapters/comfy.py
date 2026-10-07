@@ -48,7 +48,8 @@ def _request(url, timeout_s, *, payload=None, raw_body=None, headers=None, limit
             require(len(raw) <= limit, "provider_oversize", 502, "服务响应超过限制")
             return raw, response.headers.get_content_type()
     except HTTPError as error:
-        raise DomainError("provider_rejected" if body is not None and 400 <= error.code < 500 else "provider_http",
+        error.close()
+        raise DomainError("provider_rejected" if body is not None and error.code in (401, 403, 404) else "provider_http",
                           502, f"服务返回 HTTP {error.code}", {"http_status": error.code}) from None
     except (URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as error:
         raise DomainError("provider_timeout" if isinstance(error, (TimeoutError, socket.timeout)) or

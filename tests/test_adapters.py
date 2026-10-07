@@ -1,10 +1,13 @@
 """Provider boundary tests use a local HTTP server, never a real model."""
 
+import copy
 import json
+import struct
 import tempfile
 import threading
 import time
 import unittest
+import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +23,13 @@ from workbench.worker import Worker
 
 START = 1710000000000
 END = START + 2000
+
+
+def tiny_png():
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b""))
 INFO = {"ImageNode": {"input": {"required": {"width": ["INT", {"min": 64, "max": 2048}],
                                             "height": ["INT", {"min": 64, "max": 2048}],
                                             "frames": ["INT", {"min": 1, "max": 120}]}}}}
@@ -35,7 +45,7 @@ class Fixture(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.calls.append(("GET", self.path))
         if self.path.startswith("/view?"):
-            self.reply(200, b"fake-video", "application/octet-stream")
+            self.reply(200, self.server.view_body, self.server.view_type)
             return
         if self.path.startswith("/history/"):
             prompt_id = self.path.split("/")[-1]
@@ -95,6 +105,8 @@ class AdapterTests(unittest.TestCase):
         self.server.prompt_status = 200
         self.server.prompt_reply = {"prompt_id": "mine", "number": 0, "node_errors": {}}
         self.server.prompt_raw = None
+        self.server.view_body = tiny_png()
+        self.server.view_type = "image/png"
         self.server.text_status = 200
         self.server.text_reply = {"choices": [{"message": {"role": "assistant", "content": '{"idea":"new"}'}}]}
         self.server.slow = False
@@ -102,7 +114,7 @@ class AdapterTests(unittest.TestCase):
         self.server.history = {"mine": {"status": {"status_str": "success", "completed": True,
             "messages": [["execution_start", {"prompt_id": "mine", "timestamp": START}],
                          ["execution_success", {"prompt_id": "mine", "timestamp": END}]]},
-            "outputs": {"2": {"gifs": [{"filename": "shot.mp4", "subfolder": "", "type": "output"}]}}}}
+            "outputs": {"2": {"images": [{"filename": "shot.png", "subfolder": "", "type": "output"}]}}}}
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.url = f"http://127.0.0.1:{self.server.server_port}"
@@ -127,6 +139,21 @@ class AdapterTests(unittest.TestCase):
                                  (WORKFLOW, {"width": 4096})]:
             with self.assertRaises(DomainError):
                 bind_workflow(workflow, BINDINGS, values, INFO)
+
+    def test_static_inputs_and_links_are_validated(self):
+        info = {**copy.deepcopy(INFO), "OutputNode": {"input": {"required": {"image": ["IMAGE"],
+            "mode": [["fast", "quality"]]}}, "output": []}}
+        good = {**WORKFLOW, "2": {"class_type": "OutputNode", "inputs": {"image": ["1", 0], "mode": "fast"}}}
+        info["ImageNode"]["output"] = ["IMAGE"]
+        self.assertEqual(bind_workflow(good, BINDINGS, {}, info)["2"]["inputs"]["image"], ["1", 0])
+        for invalid in [
+            {**WORKFLOW, "1": {"class_type": "ImageNode", "inputs": {"width": 9999, "height": 512, "frames": 24}}},
+            {**good, "2": {"class_type": "OutputNode", "inputs": {"image": ["missing", 0], "mode": "fast"}}},
+            {**good, "2": {"class_type": "OutputNode", "inputs": {"image": ["1", 2], "mode": "fast"}}},
+            {**good, "2": {"class_type": "OutputNode", "inputs": {"image": ["1", 0], "mode": "bad"}}},
+        ]:
+            with self.subTest(invalid=invalid), self.assertRaises(DomainError):
+                bind_workflow(invalid, BINDINGS, {}, info)
 
     def test_http_rejection_and_ambiguous_submit_are_distinct(self):
         adapter = ComfyAdapter(self.url, 0.05)
@@ -189,9 +216,9 @@ class AdapterTests(unittest.TestCase):
         state = adapter.status("mine")
         self.assertEqual(state["started_at"], datetime.fromtimestamp(START / 1000, timezone.utc).isoformat())
         self.assertEqual(state["finished_at"], datetime.fromtimestamp(END / 1000, timezone.utc).isoformat())
-        self.assertEqual(adapter.collect("mine")[0]["content"], b"fake-video")
+        self.assertEqual(adapter.collect("mine")[0]["content"], tiny_png())
         self.assertFalse(any("someone-else" in str(call) for call in self.server.calls))
-        self.server.history["mine"]["outputs"]["2"]["gifs"][0]["filename"] = "../escape.mp4"
+        self.server.history["mine"]["outputs"]["2"]["images"][0]["filename"] = "../escape.png"
         with self.assertRaises(DomainError):
             adapter.collect("mine")
 
@@ -225,6 +252,7 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(queue.get_job(job["id"])["state"], "running")
             self.assertEqual(result["candidate_assets"][0]["project_id"], first["id"])
             self.assertEqual(result["candidate_assets"][0]["rights"]["episode_id"], ep["id"])
+            self.assertEqual(result["candidate_assets"][0]["rights"]["media_qc"], "pending_decode")
             self.assertEqual(store.list_assets(other["id"]), [])
             self.assertIsNone(store.get_shot(shot["id"])["selected_candidate_id"])
             self.assertNotEqual(other_ep["id"], ep["id"])
@@ -237,6 +265,73 @@ class AdapterTests(unittest.TestCase):
             [{"role": "user", "content": "idea"}], {"type": "object"})
         self.assertEqual(response["suggestion"], {"idea": "new"})
         self.assertEqual(json.loads([call for call in self.server.calls if call[0] == "POST"][-1][2])["model"], "fiction-model")
+
+    def test_text_schema_rejects_wrong_result_and_unsupported_rules(self):
+        adapter = TextAdapter(self.url + "/v1/chat/completions", "fiction-model")
+        schema = {"type": "object", "required": ["beats"], "properties": {"beats": {"type": "array",
+                  "items": {"type": "object", "required": ["mood"], "properties": {
+                      "mood": {"type": "string", "enum": ["tense", "calm"]}}}}}}
+        self.server.text_reply = {"choices": [{"message": {"content": '{"beats":[{"mood":"wrong"}]}'}}]}
+        with self.assertRaises(DomainError) as caught:
+            adapter.generate([{"role": "user", "content": "idea"}], schema)
+        self.assertEqual(caught.exception.code, "invalid_text_response")
+        before = len(self.server.calls)
+        with self.assertRaises(DomainError) as caught:
+            adapter.generate([{"role": "user", "content": "idea"}], {"type": "object", "oneOf": []})
+        self.assertEqual(caught.exception.code, "invalid_schema")
+        self.assertEqual(len(self.server.calls), before)
+
+    def test_invalid_media_response_never_imports_candidate(self):
+        self.server.dynamic_history = True
+        self.server.view_body = b"<html>error</html>"
+        self.server.view_type = "text/html"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite", root / "data")
+            project = store.create_project("Fiction")
+            episode = store.create_episode(project["id"], "Episode")
+            shot = store.save_shot(episode["id"], {})
+            queue = Queue(store)
+            job = queue.enqueue({"project_id": project["id"], "episode_id": episode["id"], "shot_id": shot["id"]},
+                                "h3", {"values": {}})
+            handler = make_h3_handler(queue, store, ComfyAdapter(self.url, 1), WORKFLOW, BINDINGS)
+            Worker(queue, "gpu", {"h3": handler}).run_once()
+            self.assertEqual(queue.get_job(job["id"])["state"], "needs_reconcile")
+            self.assertEqual(store.list_assets(project["id"]), [])
+
+    def test_worker_keeps_http_408_submission_reserved(self):
+        self.server.prompt_status = 408
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite", root / "data")
+            project = store.create_project("Fiction")
+            episode = store.create_episode(project["id"], "Episode")
+            shot = store.save_shot(episode["id"], {})
+            queue = Queue(store)
+            job = queue.enqueue({"project_id": project["id"], "episode_id": episode["id"], "shot_id": shot["id"]},
+                                "h3", {"values": {}})
+            handler = make_h3_handler(queue, store, ComfyAdapter(self.url, 1), WORKFLOW, BINDINGS)
+            Worker(queue, "gpu", {"h3": handler}).run_once()
+            self.assertEqual(queue.get_job(job["id"])["state"], "needs_reconcile")
+            self.assertIsNotNone(queue.get_job(job["id"])["submission_attempted_at"])
+            self.assertIsNone(queue.claim("gpu"))
+
+    def test_generic_http_400_does_not_claim_proven_rejection(self):
+        self.server.prompt_status = 400
+        with self.assertRaises(DomainError) as caught:
+            ComfyAdapter(self.url, 1).submit(WORKFLOW, "client")
+        self.assertEqual(caught.exception.code, "submission_uncertain")
+
+    def test_text_nested_valid_suggestion_stays_pending(self):
+        schema = {"type": "object", "required": ["beats"], "additionalProperties": False,
+                  "properties": {"beats": {"type": "array", "items": {"type": "object",
+                      "required": ["mood"], "properties": {"mood": {"type": "string",
+                      "enum": ["tense", "calm"]}}}}}}
+        self.server.text_reply = {"choices": [{"message": {"content": '{"beats":[{"mood":"tense"}]}'}}]}
+        response = TextAdapter(self.url + "/v1/chat/completions", "fiction-model").generate(
+            [{"role": "user", "content": "idea"}], schema)
+        self.assertEqual(response["suggestion"], {"beats": [{"mood": "tense"}]})
+        self.assertEqual(response["status"], "pending_adoption")
 
     def test_worker_records_observed_failure_without_success(self):
         self.server.dynamic_history = True

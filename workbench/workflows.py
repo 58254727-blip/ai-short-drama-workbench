@@ -5,9 +5,42 @@ import os
 import tempfile
 import time
 from pathlib import Path
+import math
 
 from .domain import DomainError, require
 from .worker import ProviderFailure
+
+
+def _validate_input(value, spec, workflow, object_info, uploaded_names):
+    require(isinstance(spec, list) and bool(spec), "invalid_workflow", 400, "节点输入规格无效")
+    datatype = spec[0]
+    if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and type(value[1]) is int:
+        source = workflow.get(value[0])
+        require(isinstance(source, dict) and value[1] >= 0, "invalid_link", 400, "节点连接源无效")
+        source_meta = object_info.get(source.get("class_type"), {})
+        outputs = source_meta.get("output", [])
+        require(isinstance(outputs, list) and value[1] < len(outputs), "invalid_link", 400, "节点输出不存在")
+        source_type = outputs[value[1]]
+        require(source_type == datatype or (isinstance(datatype, list) and source_type == "STRING"),
+                "invalid_link", 400, "节点连接类型不匹配")
+        return
+    limits = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+    if datatype == "INT":
+        valid = type(value) is int
+    elif datatype == "FLOAT":
+        valid = type(value) in (int, float) and math.isfinite(value)
+    elif datatype == "STRING":
+        valid = isinstance(value, str)
+    elif datatype == "BOOLEAN":
+        valid = type(value) is bool
+    elif isinstance(datatype, list):
+        valid = value in datatype or value in uploaded_names
+    else:
+        valid = False
+    require(valid, "invalid_value", 400, "节点输入类型或选项无效")
+    if datatype in ("INT", "FLOAT"):
+        require(limits.get("min", value) <= value <= limits.get("max", value),
+                "invalid_value", 400, "数值输入超出节点范围")
 
 
 def bind_workflow(workflow: dict, bindings: dict, values: dict, object_info: dict,
@@ -36,23 +69,13 @@ def bind_workflow(workflow: dict, bindings: dict, values: dict, object_info: dic
         declared = {**meta.get("required", {}), **meta.get("optional", {})}
         field = binding["input"]
         require(field in declared and field in node["inputs"], "invalid_binding", 400, "绑定输入不存在")
-        spec = declared[field]
-        require(isinstance(spec, list) and bool(spec), "invalid_binding", 400, "节点输入规格无效")
-        datatype = spec[0]
-        limits = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
-        if datatype == "INT":
-            require(type(value) is int and limits.get("min", value) <= value <= limits.get("max", value),
-                    "invalid_value", 400, "整数输入超出节点范围")
-        elif datatype == "FLOAT":
-            require(type(value) in (int, float) and limits.get("min", value) <= value <= limits.get("max", value),
-                    "invalid_value", 400, "数值输入超出节点范围")
-        elif isinstance(datatype, list):
-            require(value in datatype or value in uploaded_names, "invalid_value", 400, "输入不在节点选项内")
-        elif datatype == "STRING":
-            require(isinstance(value, str), "invalid_value", 400, "文本输入无效")
-        else:
-            raise DomainError("invalid_binding", 400, "此节点输入类型不可绑定")
         node["inputs"][field] = value
+    for node in bound.values():
+        meta = object_info[node["class_type"]]["input"]
+        declared = {**meta.get("required", {}), **meta.get("optional", {})}
+        require(set(node["inputs"]) <= set(declared), "invalid_input", 400, "工作流包含未知输入")
+        for field, value in node["inputs"].items():
+            _validate_input(value, declared[field], bound, object_info, uploaded_names)
     return bound
 
 
@@ -64,6 +87,33 @@ def _scope(store, job):
     shot = store.get_shot(job["shot_id"])
     require(episode["project_id"] == job["project_id"] and shot["episode_id"] == job["episode_id"],
             "ownership_conflict", 409, "任务素材范围冲突")
+
+
+def _media_kind(filename: str, content: bytes) -> str:
+    """Reject obvious non-media; full decoding belongs to the later QC stage."""
+    require(isinstance(content, bytes), "invalid_media", 502, "输出内容无效")
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".png":
+        valid = (len(content) >= 45 and content.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR")
+                 and content.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82"))
+        kind = "image"
+    elif suffix in (".jpg", ".jpeg"):
+        valid = len(content) >= 4 and content.startswith(b"\xff\xd8\xff") and content.endswith(b"\xff\xd9")
+        kind = "image"
+    elif suffix == ".webp":
+        valid = len(content) >= 16 and content.startswith(b"RIFF") and content[8:12] == b"WEBP"
+        kind = "image"
+    elif suffix in (".mp4", ".mov"):
+        valid = len(content) >= 16 and content[4:8] == b"ftyp"
+        kind = "video"
+    elif suffix in (".webm", ".mkv"):
+        marker = b"webm" if suffix == ".webm" else b"matroska"
+        valid = len(content) >= 16 and content.startswith(b"\x1a\x45\xdf\xa3") and marker in content[:256]
+        kind = "video"
+    else:
+        raise DomainError("unsupported_output", 502, "输出文件格式不支持")
+    require(valid, "invalid_media", 502, "输出文件签名与类型不符")
+    return kind
 
 
 def make_h3_handler(queue, store, adapter, workflow: dict, bindings: dict, *,
@@ -122,9 +172,7 @@ def make_h3_handler(queue, store, adapter, workflow: dict, bindings: dict, *,
                     staging.mkdir(parents=True, exist_ok=True)
                     for file in files:
                         suffix = Path(file["filename"]).suffix.lower()
-                        kind = "video" if suffix in (".mp4", ".webm", ".mov", ".mkv") else "image"
-                        require(suffix in (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".webp"),
-                                "unsupported_output", 502, "输出文件格式不支持")
+                        kind = _media_kind(file["filename"], file["content"])
                         fd, path = tempfile.mkstemp(prefix="comfy-", suffix=suffix, dir=staging)
                         try:
                             with os.fdopen(fd, "wb") as stream:
@@ -132,7 +180,8 @@ def make_h3_handler(queue, store, adapter, workflow: dict, bindings: dict, *,
                             asset = store.import_asset(job["project_id"], Path(path), kind,
                                                        {"source": "comfy", "job_id": job_id,
                                                         "prompt_id": prompt_id, "episode_id": job["episode_id"],
-                                                        "shot_id": job["shot_id"], "status": "candidate"})
+                                                        "shot_id": job["shot_id"], "status": "candidate",
+                                                        "media_qc": "pending_decode"})
                             candidates.append(asset)
                         finally:
                             Path(path).unlink(missing_ok=True)
