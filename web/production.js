@@ -1,4 +1,4 @@
-import {api, byId, escapeHtml, option, field, area} from './api.js';
+import {api, asciiJsonHeader, byId, escapeHtml, option, field, area} from './api.js';
 import {heading, section, empty} from './views.js';
 import {splitShotNotes, mergeShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from './state.js';
 
@@ -60,7 +60,7 @@ export function renderAssets(ctx) {
     const kind = byId('asset-kind').value;
     const rights = {source:byId('asset-source').value.trim(), license:byId('asset-license').value.trim(), status:'unreviewed'};
     if (!rights.source) throw new Error('请填写素材来源');
-    await api(`/api/projects/${ctx.project.id}/assets/upload`, {method:'POST', body:file, headers:{'X-Asset-Kind':kind,'X-Asset-Rights':JSON.stringify(rights)}});
+    await api(`/api/projects/${ctx.project.id}/assets/upload`, {method:'POST', body:file, headers:{'X-Asset-Kind':kind,'X-Asset-Rights':asciiJsonHeader(rights)}});
     await ctx.reload(); ctx.notify('素材已导入；尚未选片或人工验收');
   });
 }

@@ -18,6 +18,11 @@ export async function api(path, options = {}) {
   return type.includes('application/json') ? response.json() : response;
 }
 
+export function asciiJsonHeader(value) {
+  return JSON.stringify(value).replace(/[\u007f-\uffff]/g, character =>
+    `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 export const byId = id => document.getElementById(id);
 export const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 export const option = (value, label, selected = false) => `<option value="${escapeHtml(value)}"${selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;

@@ -135,6 +135,17 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(failed.exception.code, 422)
         self.assertEqual(len(self.call("GET", f"/api/projects/{left['id']}/assets")[1]), 1)
 
+    def test_ascii_escaped_unicode_rights_header_preserves_exact_upload_record(self):
+        _, project = self.call("POST", "/api/projects", {"title":"中文测试"})
+        rights = {"source":"手动导入\n雨夜\"甲\"😀", "license":"自有或已获授权🐉", "status":"unreviewed"}
+        encoded = json.dumps(rights, ensure_ascii=True, separators=(",", ":"))
+        self.assertTrue(encoded.isascii())
+        request = Request(self.base + f"/api/projects/{project['id']}/assets/upload", data=b"fictional document", method="POST",
+                          headers={"X-Jingxu-Request":"1","X-Asset-Kind":"document","X-Asset-Rights":encoded})
+        with urlopen(request) as response: asset = json.load(response)
+        self.assertEqual(asset["rights"], rights)
+        self.assertEqual(self.call("GET", f"/api/projects/{project['id']}/assets/{asset['id']}")[1]["rights"], rights)
+
     def test_settings_never_return_operator_secret(self):
         root = Path(self.temp.name)
         (root / "operator-config.json").write_text(json.dumps({"text": {"endpoint": "http://127.0.0.1:9999", "model": "x", "secret": "TOP_SECRET"}}))

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from '../web/state.js';
+import {asciiJsonHeader} from '../web/api.js';
 
 test('per-shot motivation and choice preserve unrelated creative notes', () => {
   const original = '人物关系待定\n动机[shot-a]: 旧动机\n选择[shot-b]: 别的镜头';
@@ -55,4 +56,22 @@ test('review selection uses the visible second shot and its own timeline source'
   assert.equal(selected.item.source_asset_id, 'video-b');
   assert.equal(selected.shot.dialogue[0].speaker_id, '乙');
   assert.equal(timelineOffsetForShot([{shot_id:'first',in_ms:200,out_ms:1200},{shot_id:'second',in_ms:0,out_ms:800}], 'second'), 1000);
+});
+
+test('native Headers rejects the current raw Chinese rights JSON', () => {
+  const rights = {source:'手动导入', license:'自有或已获授权', status:'unreviewed'};
+  assert.throws(() => new Headers({'X-Asset-Rights':JSON.stringify(rights)}), TypeError);
+});
+
+test('rights header safely round trips Chinese, emoji, quotes and newlines', () => {
+  const examples = [
+    {source:'手动导入',license:'自有或已获授权',status:'unreviewed'},
+    {source:'雨夜「甲」"画面"\n😀',license:'授权：长春🐉\n仅用于测试',status:'unreviewed'}
+  ];
+  for (const rights of examples) {
+    const encoded = asciiJsonHeader(rights);
+    assert.match(encoded, /^[\x00-\x7f]*$/);
+    const headers = new Headers({'X-Asset-Rights':encoded});
+    assert.deepEqual(JSON.parse(headers.get('X-Asset-Rights')), rights);
+  }
 });
