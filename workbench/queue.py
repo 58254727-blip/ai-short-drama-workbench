@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  source_revision INTEGER NOT NULL, source_snapshot TEXT NOT NULL, retry_classification TEXT,
  failure_code TEXT, failure_message TEXT,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lease_until TEXT,
- claim_token TEXT, execution_started_at TEXT);
+ claim_token TEXT, execution_started_at TEXT, submission_attempted_at TEXT);
 CREATE INDEX IF NOT EXISTS jobs_ready_idx ON jobs(resource,state,created_at,id);
 CREATE INDEX IF NOT EXISTS jobs_scope_idx ON jobs(project_id,episode_id,shot_id);
 CREATE TABLE IF NOT EXISTS job_phases (
@@ -73,7 +73,7 @@ class Queue:
         with store.transaction() as conn:
             conn.executescript(SCHEMA)
             for table, additions in (
-                ("jobs", {"claim_token": "TEXT", "execution_started_at": "TEXT"}),
+                ("jobs", {"claim_token": "TEXT", "execution_started_at": "TEXT", "submission_attempted_at": "TEXT"}),
                 ("job_phases", {"interrupted_at": "TEXT"}),
             ):
                 columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -134,8 +134,8 @@ class Queue:
                     payload=_json(payload), result=None, external_id=None, retry_of_id=retry_of_id,
                     source_revision=source_revision, source_snapshot=_json(source_snapshot), retry_classification=retry_classification,
                     failure_code=None, failure_message=None, created_at=_stamp(when), updated_at=_stamp(when), lease_until=None,
-                    claim_token=None, execution_started_at=None)
-        conn.execute("INSERT INTO jobs VALUES (:id,:project_id,:episode_id,:shot_id,:kind,:resource,:state,:payload,:result,:external_id,:retry_of_id,:source_revision,:source_snapshot,:retry_classification,:failure_code,:failure_message,:created_at,:updated_at,:lease_until,:claim_token,:execution_started_at)", item)
+                    claim_token=None, execution_started_at=None, submission_attempted_at=None)
+        conn.execute("INSERT INTO jobs VALUES (:id,:project_id,:episode_id,:shot_id,:kind,:resource,:state,:payload,:result,:external_id,:retry_of_id,:source_revision,:source_snapshot,:retry_classification,:failure_code,:failure_message,:created_at,:updated_at,:lease_until,:claim_token,:execution_started_at,:submission_attempted_at)", item)
         self._phase(conn, item["id"], "queued", when)
         return self._job(conn, self._row(conn, item["id"]))
 
@@ -176,12 +176,24 @@ class Queue:
             require(row["state"] in BUSY, "invalid_state", 409, "任务未运行或待核对")
             conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", (_stamp(_now() + timedelta(seconds=60)), job_id))
 
+    def mark_submission_attempt(self, job_id: str, claim_token: str) -> None:
+        """Persist intent immediately before sending a provider request."""
+        with self.store.transaction() as conn:
+            row = self._row(conn, job_id)
+            self._owned(row, claim_token)
+            require(row["resource"] == "gpu" and row["state"] == "submitting" and row["external_id"] is None,
+                    "invalid_state", 409, "任务不在提交前状态")
+            if row["submission_attempted_at"] is None:
+                conn.execute("UPDATE jobs SET submission_attempted_at=?,updated_at=? WHERE id=?", (_stamp(), _stamp(), job_id))
+
     def record_external(self, job_id: str, external_id: str, claim_token: str) -> None:
         require(isinstance(external_id, str) and bool(external_id.strip()), "invalid_external_id", 400, "外部任务 ID 不能为空")
         with self.store.transaction() as conn:
             row = self._row(conn, job_id)
             self._owned(row, claim_token)
             require(row["resource"] == "gpu" and row["state"] in ("submitting", "needs_reconcile"), "invalid_state", 409, "任务不在可核对状态")
+            require(row["state"] == "needs_reconcile" or row["submission_attempted_at"] is not None,
+                    "invalid_state", 409, "尚未记录提交尝试")
             if row["external_id"] == external_id:
                 return
             require(row["external_id"] is None, "external_conflict", 409, "外部任务 ID 已记录")
@@ -210,7 +222,11 @@ class Queue:
             self._owned(row, claim_token)
             require(row["state"] in BUSY, "invalid_state", 409, "任务无法完成")
             when = _now()
-            if state == "succeeded" and row["resource"] == "gpu":
+            if row["resource"] == "gpu":
+                if state == "failed" and execution_finished_at is None:
+                    conn.execute("UPDATE jobs SET state='needs_reconcile',failure_code=?,failure_message=?,updated_at=? WHERE id=?",
+                                 (code, message, _stamp(), job_id))
+                    return
                 require(row["state"] == "running" and row["external_id"] is not None and row["execution_started_at"] is not None,
                         "execution_unverified", 409, "GPU 执行未核实完成")
                 require(execution_finished_at is not None, "execution_unverified", 409, "缺少外部执行结束时间")
@@ -224,9 +240,38 @@ class Queue:
         require(isinstance(result, dict), "invalid_result", 400, "任务结果必须是对象")
         self._terminal(job_id, "succeeded", claim_token, result=result, execution_finished_at=execution_finished_at)
 
-    def fail(self, job_id: str, code: str, message: str, claim_token: str) -> None:
+    def fail(self, job_id: str, code: str, message: str, claim_token: str, *, execution_finished_at: str | None = None) -> None:
         require(isinstance(code, str) and bool(code.strip()) and isinstance(message, str), "invalid_failure", 400, "失败分类或原因错误")
-        self._terminal(job_id, "failed", claim_token, code=code, message=message)
+        self._terminal(job_id, "failed", claim_token, code=code, message=message, execution_finished_at=execution_finished_at)
+
+    def fail_preflight(self, job_id: str, code: str, message: str, claim_token: str) -> None:
+        """Use only before any provider submission attempt has been recorded."""
+        require(isinstance(code, str) and bool(code.strip()) and isinstance(message, str), "invalid_failure", 400, "失败分类或原因错误")
+        with self.store.transaction() as conn:
+            row = self._row(conn, job_id)
+            self._owned(row, claim_token)
+            require(row["resource"] == "gpu" and row["state"] == "submitting" and row["submission_attempted_at"] is None
+                    and row["external_id"] is None and row["execution_started_at"] is None,
+                    "invalid_state", 409, "已尝试提交，不能按预检失败释放 GPU")
+            when = _now()
+            conn.execute("UPDATE jobs SET state='failed',failure_code=?,failure_message=?,claim_token=NULL,lease_until=NULL,updated_at=? WHERE id=?",
+                         (code, message, _stamp(when), job_id))
+            self._phase(conn, job_id, None, when)
+
+    def reject_submission(self, job_id: str, code: str, message: str, rejected_at: str, claim_token: str) -> None:
+        """Provider explicitly rejected submission without starting execution."""
+        require(isinstance(code, str) and bool(code.strip()) and isinstance(message, str), "invalid_failure", 400, "失败分类或原因错误")
+        observed = _observed_utc(rejected_at, "提交拒绝")
+        with self.store.transaction() as conn:
+            row = self._row(conn, job_id)
+            self._owned(row, claim_token)
+            require(row["resource"] == "gpu" and row["state"] in ("submitting", "needs_reconcile") and
+                    row["submission_attempted_at"] is not None and row["execution_started_at"] is None,
+                    "invalid_state", 409, "没有未执行的提交拒绝证据")
+            require(observed >= datetime.fromisoformat(row["submission_attempted_at"]), "invalid_timestamp", 400, "拒绝时间早于提交")
+            conn.execute("UPDATE jobs SET state='failed',failure_code=?,failure_message=?,claim_token=NULL,lease_until=NULL,updated_at=? WHERE id=?",
+                         (code, message, _stamp(), job_id))
+            self._phase(conn, job_id, None, observed)
 
     def recover(self) -> list[dict]:
         """Call at startup; uncertain GPU submissions remain reserved for external reconciliation."""

@@ -31,6 +31,7 @@ class QueueTests(unittest.TestCase):
             conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), job_id))
 
     def gpu_started(self, job):
+        self.queue.mark_submission_attempt(job["id"], job["claim_token"])
         self.queue.record_external(job["id"], "external-" + job["id"], job["claim_token"])
         started = datetime.now(timezone.utc).isoformat()
         self.queue.record_execution_started(job["id"], started, job["claim_token"])
@@ -103,6 +104,7 @@ class QueueTests(unittest.TestCase):
     def test_external_id_survives_and_recovery_keeps_gpu_slot(self):
         job = self.enqueue()
         claimed = self.queue.claim("gpu")
+        self.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
         self.queue.record_external(job["id"], "remote-123", claimed["claim_token"])
         self.assertEqual("submitting", self.queue.get_job(job["id"])["state"])
         start = datetime.now(timezone.utc).isoformat()
@@ -139,7 +141,8 @@ class QueueTests(unittest.TestCase):
         first = self.enqueue()
         self.store.save_shot(self.episode["id"], {"id": self.shot["id"], "action": "new action"}, expected_revision=1)
         claimed = self.queue.claim("gpu")
-        self.queue.fail(first["id"], "character", "脸不一致", claimed["claim_token"])
+        self.gpu_started(claimed)
+        self.queue.fail(first["id"], "character", "脸不一致", claimed["claim_token"], execution_finished_at=datetime.now(timezone.utc).isoformat())
         second = self.queue.retry(first["id"], {"plan_revision": 1, "strategy": "a", "seed": 2})
         self.assertEqual(first["id"], second["retry_of_id"])
         self.assertEqual(first["source_revision"], second["source_revision"])
@@ -147,7 +150,8 @@ class QueueTests(unittest.TestCase):
         self.assertEqual("", second["source_snapshot"]["shot"]["action"])
         self.assertEqual("character", second["retry_classification"])
         claimed = self.queue.claim("gpu")
-        self.queue.fail(second["id"], "character", "脸仍不一致", claimed["claim_token"])
+        self.gpu_started(claimed)
+        self.queue.fail(second["id"], "character", "脸仍不一致", claimed["claim_token"], execution_finished_at=datetime.now(timezone.utc).isoformat())
         with self.assertRaises(DomainError) as raised:
             self.queue.retry(second["id"], {"plan_revision": 1, "strategy": "a", "seed": 3})
         self.assertEqual("retry_plan_required", raised.exception.code)
@@ -155,7 +159,8 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(2, changed["payload"]["plan_revision"])
         self.assertEqual(2, len([j for j in self.queue.list_jobs() if j["state"] == "failed"]))
         claimed = self.queue.claim("gpu")
-        self.queue.fail(changed["id"], "character", "仍需修改", claimed["claim_token"])
+        self.gpu_started(claimed)
+        self.queue.fail(changed["id"], "character", "仍需修改", claimed["claim_token"], execution_finished_at=datetime.now(timezone.utc).isoformat())
         with self.assertRaises(DomainError) as raised:
             self.queue.retry(changed["id"], {"plan_revision": 1, "strategy": "a", "seed": 9})
         self.assertEqual("retry_plan_required", raised.exception.code)
@@ -214,6 +219,7 @@ class QueueTests(unittest.TestCase):
         claimed = self.queue.claim("gpu")
         with self.assertRaises(DomainError):
             self.queue.finish(job["id"], {"candidate": "fake"}, claimed["claim_token"], execution_finished_at=datetime.now(timezone.utc).isoformat())
+        self.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
         self.queue.record_external(job["id"], "external-1", claimed["claim_token"])
         with self.assertRaises(DomainError):
             self.queue.finish(job["id"], {"candidate": "fake"}, claimed["claim_token"], execution_finished_at=datetime.now(timezone.utc).isoformat())
@@ -302,6 +308,106 @@ class QueueTests(unittest.TestCase):
         claimed = self.queue.claim("cpu")
         self.queue.fail(newer["id"], "dialogue", "bad", claimed["claim_token"])
         self.assertEqual("queued", self.queue.retry(newer["id"])["state"])
+
+    def test_gpu_handler_error_after_start_stays_reserved_for_reconciliation(self):
+        first = self.enqueue()
+        self.enqueue()
+
+        def broken(kind, job):
+            self.gpu_started(job)
+            raise RuntimeError("poll failed")
+
+        self.assertTrue(Worker(self.queue, "gpu", {"h3": broken}).run_once())
+        uncertain = self.queue.get_job(first["id"])
+        self.assertEqual("needs_reconcile", uncertain["state"])
+        self.assertEqual("RuntimeError", uncertain["failure_code"])
+        self.assertIsNotNone(uncertain["claim_token"])
+        self.assertIsNotNone(uncertain["lease_until"])
+        self.assertIsNone(uncertain["phases"][-1]["exited_at"])
+        self.assertIsNone(uncertain["phases"][-1]["duration_ms"])
+        self.assertIsNone(self.queue.claim("gpu"))
+
+    def test_gpu_missing_finish_event_stays_reserved(self):
+        first = self.enqueue()
+        self.enqueue()
+
+        def missing_end(kind, job):
+            self.gpu_started(job)
+            return {"candidate": "not yet verified"}
+
+        self.assertTrue(Worker(self.queue, "gpu", {"h3": missing_end}).run_once())
+        uncertain = self.queue.get_job(first["id"])
+        self.assertEqual("needs_reconcile", uncertain["state"])
+        self.assertEqual("execution_unverified", uncertain["failure_code"])
+        self.assertIsNone(uncertain["phases"][-1]["exited_at"])
+        self.assertIsNone(self.queue.claim("gpu"))
+
+    def test_gpu_ambiguous_submission_without_response_stays_reserved(self):
+        first = self.enqueue()
+        self.enqueue()
+
+        def lost_response(kind, job):
+            self.queue.mark_submission_attempt(job["id"], job["claim_token"])
+            raise TimeoutError("submit response lost")
+
+        self.assertTrue(Worker(self.queue, "gpu", {"h3": lost_response}).run_once())
+        uncertain = self.queue.get_job(first["id"])
+        self.assertEqual("needs_reconcile", uncertain["state"])
+        self.assertIsNone(uncertain["external_id"])
+        self.assertEqual("preparation", uncertain["phases"][-1]["phase"])
+        self.assertIsNone(uncertain["phases"][-1]["exited_at"])
+        self.assertIsNone(self.queue.claim("gpu"))
+
+    def test_gpu_known_preflight_failure_releases_without_execution(self):
+        first = self.enqueue()
+        second = self.enqueue()
+        claimed = self.queue.claim("gpu")
+        self.queue.fail_preflight(first["id"], "missing_workflow", "not configured", claimed["claim_token"])
+        self.assertEqual("failed", self.queue.get_job(first["id"])["state"])
+        self.assertEqual("preparation", self.queue.get_job(first["id"])["phases"][-1]["phase"])
+        self.assertEqual(second["id"], self.queue.claim("gpu")["id"])
+
+    def test_worker_accepts_handler_recorded_preflight_failure(self):
+        first = self.enqueue()
+
+        def preflight(kind, job):
+            self.queue.fail_preflight(job["id"], "missing_workflow", "not configured", job["claim_token"])
+            return {}
+
+        self.assertTrue(Worker(self.queue, "gpu", {"h3": preflight}).run_once())
+        self.assertEqual("failed", self.queue.get_job(first["id"])["state"])
+
+    def test_gpu_observed_failure_uses_provider_end_and_releases(self):
+        first = self.enqueue()
+        second = self.enqueue()
+        claimed = self.queue.claim("gpu")
+        self.gpu_started(claimed)
+        ended = datetime.now(timezone.utc).isoformat()
+        self.queue.fail(first["id"], "character", "face mismatch", claimed["claim_token"], execution_finished_at=ended)
+        failed = self.queue.get_job(first["id"])
+        self.assertEqual("failed", failed["state"])
+        self.assertEqual(ended, failed["phases"][-1]["exited_at"])
+        self.assertEqual(second["id"], self.queue.claim("gpu")["id"])
+
+    def test_submitted_gpu_cannot_be_labeled_preflight_failure(self):
+        job = self.enqueue()
+        claimed = self.queue.claim("gpu")
+        self.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
+        with self.assertRaises(DomainError):
+            self.queue.fail_preflight(job["id"], "bad", "after submit", claimed["claim_token"])
+        self.assertEqual("submitting", self.queue.get_job(job["id"])["state"])
+
+    def test_provider_rejected_submission_releases_at_observed_time(self):
+        first = self.enqueue()
+        second = self.enqueue()
+        claimed = self.queue.claim("gpu")
+        self.queue.mark_submission_attempt(first["id"], claimed["claim_token"])
+        rejected_at = datetime.now(timezone.utc).isoformat()
+        self.queue.reject_submission(first["id"], "rejected", "provider declined", rejected_at, claimed["claim_token"])
+        failed = self.queue.get_job(first["id"])
+        self.assertEqual("failed", failed["state"])
+        self.assertEqual(rejected_at, failed["phases"][-1]["exited_at"])
+        self.assertEqual(second["id"], self.queue.claim("gpu")["id"])
 
     def test_queue_upgrades_prior_local_schema_without_losing_jobs(self):
         legacy_path = Path(self.temp.name) / "legacy.sqlite"
