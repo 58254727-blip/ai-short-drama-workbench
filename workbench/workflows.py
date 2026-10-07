@@ -11,7 +11,7 @@ from .domain import DomainError, require
 from .worker import ProviderFailure
 
 
-def _validate_input(value, spec, workflow, object_info, uploaded_names):
+def _validate_input(value, spec, workflow, object_info, uploaded_name):
     require(isinstance(spec, list) and bool(spec), "invalid_workflow", 400, "节点输入规格无效")
     datatype = spec[0]
     if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and type(value[1]) is int:
@@ -34,7 +34,7 @@ def _validate_input(value, spec, workflow, object_info, uploaded_names):
     elif datatype == "BOOLEAN":
         valid = type(value) is bool
     elif isinstance(datatype, list):
-        valid = value in datatype or value in uploaded_names
+        valid = value in datatype or (uploaded_name is not None and value == uploaded_name)
     else:
         valid = False
     require(valid, "invalid_value", 400, "节点输入类型或选项无效")
@@ -44,9 +44,14 @@ def _validate_input(value, spec, workflow, object_info, uploaded_names):
 
 
 def bind_workflow(workflow: dict, bindings: dict, values: dict, object_info: dict,
-                  *, uploaded_names=()) -> dict:
+                  *, uploaded_names=None) -> dict:
     require(isinstance(workflow, dict) and bool(workflow) and isinstance(bindings, dict) and
             isinstance(values, dict) and isinstance(object_info, dict), "invalid_workflow", 400, "工作流配置无效")
+    uploaded_names = {} if uploaded_names is None else uploaded_names
+    require(isinstance(uploaded_names, dict) and all(
+        isinstance(key, tuple) and len(key) == 2 and all(isinstance(part, str) for part in key)
+        and isinstance(name, str) for key, name in uploaded_names.items()),
+        "invalid_binding", 400, "上传输入绑定无效")
     bound = copy.deepcopy(workflow)
     for node_id, node in bound.items():
         require(isinstance(node_id, str) and isinstance(node, dict) and
@@ -70,12 +75,12 @@ def bind_workflow(workflow: dict, bindings: dict, values: dict, object_info: dic
         field = binding["input"]
         require(field in declared and field in node["inputs"], "invalid_binding", 400, "绑定输入不存在")
         node["inputs"][field] = value
-    for node in bound.values():
+    for node_id, node in bound.items():
         meta = object_info[node["class_type"]]["input"]
         declared = {**meta.get("required", {}), **meta.get("optional", {})}
         require(set(node["inputs"]) <= set(declared), "invalid_input", 400, "工作流包含未知输入")
         for field, value in node["inputs"].items():
-            _validate_input(value, declared[field], bound, object_info, uploaded_names)
+            _validate_input(value, declared[field], bound, object_info, uploaded_names.get((node_id, field)))
     return bound
 
 
@@ -143,7 +148,8 @@ def make_h3_handler(queue, store, adapter, workflow: dict, bindings: dict, *,
                 source = store.data_root / "assets" / asset["storage_key"]
                 name = adapter.upload_image(source.read_bytes(), asset["sha256"] + ".png")
                 bound = bind_workflow(workflow, bindings, {**values, first_frame_binding: name}, info,
-                                      uploaded_names={name})
+                                      uploaded_names={(bindings[first_frame_binding]["node"],
+                                                       bindings[first_frame_binding]["input"]): name})
 
             def mark():
                 nonlocal attempted

@@ -211,6 +211,53 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(queue.get_job(job["id"])["state"], "failed")
             self.assertFalse(any(call[0] == "POST" for call in self.server.calls))
 
+    def test_uploaded_name_exemption_applies_only_to_first_frame_input(self):
+        info = {"LoadImage": {"input": {"required": {"image": [["placeholder.png"]],
+            "mode": [["fast", "quality"]]}}}}
+        bindings = {"first_frame": {"node": "1", "input": "image"}}
+        workflow = {"1": {"class_type": "LoadImage", "inputs": {
+            "image": "placeholder.png", "mode": "fast"}}}
+        scoped_upload = {("1", "image"): "uploaded.png"}
+        bound = bind_workflow(workflow, bindings, {"first_frame": "uploaded.png"}, info,
+                              uploaded_names=scoped_upload)
+        self.assertEqual(bound["1"]["inputs"]["image"], "uploaded.png")
+        unrelated_mode = {"1": {"class_type": "LoadImage", "inputs": {
+            "image": "placeholder.png", "mode": "uploaded.png"}}}
+        with self.assertRaises(DomainError):
+            bind_workflow(unrelated_mode, bindings, {"first_frame": "uploaded.png"}, info,
+                          uploaded_names=scoped_upload)
+        self.assertEqual(self.server.calls, [])
+
+    def test_scoped_first_frame_upload_reaches_prompt_with_old_object_info_enum(self):
+        self.server.dynamic_history = True
+        self.server.info = {"LoadImage": {"input": {"required": {
+            "image": [["placeholder.png"]], "mode": [["fast", "quality"]]}}}}
+        workflow = {"1": {"class_type": "LoadImage", "inputs": {
+            "image": "placeholder.png", "mode": "fast"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "db.sqlite", root / "data")
+            project = store.create_project("Fiction")
+            episode = store.create_episode(project["id"], "Episode")
+            shot = store.save_shot(episode["id"], {})
+            staging = store.data_root / "staging"
+            staging.mkdir(parents=True, exist_ok=True)
+            source = staging / "frame.png"
+            source.write_bytes(tiny_png())
+            first_frame = store.import_asset(project["id"], source, "image", {})
+            queue = Queue(store)
+            job = queue.enqueue({"project_id": project["id"], "episode_id": episode["id"], "shot_id": shot["id"]},
+                                "h3", {"values": {}, "first_frame_asset_id": first_frame["id"]})
+            handler = make_h3_handler(queue, store, ComfyAdapter(self.url, 1), workflow,
+                                      {"first_frame": {"node": "1", "input": "image"}},
+                                      first_frame_binding="first_frame")
+            Worker(queue, "gpu", {"h3": handler}).run_once()
+            self.assertEqual(queue.get_job(job["id"])["state"], "succeeded")
+            posts = [(call[1], call[2]) for call in self.server.calls if call[0] == "POST"]
+            self.assertEqual([path for path, _ in posts], ["/upload/image", "/prompt"])
+            self.assertEqual(json.loads(posts[-1][1])["prompt"]["1"]["inputs"],
+                             {"image": "uploaded.png", "mode": "fast"})
+
     def test_history_is_scoped_and_collects_binary(self):
         adapter = ComfyAdapter(self.url, 1)
         state = adapter.status("mine")
