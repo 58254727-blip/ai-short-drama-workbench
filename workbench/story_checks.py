@@ -1,4 +1,6 @@
-"""Deterministic, addressable story structure suggestions."""
+"""Deterministic story prompts; notes labels are 动机[shot_id]: and 选择[shot_id]:."""
+
+import re
 
 
 def review_story(episode: dict) -> list[dict]:
@@ -23,8 +25,13 @@ def review_story(episode: dict) -> list[dict]:
                 if not shot.get(field, "").strip():
                     add(scene_id, shot_id, field, message)
             notes = episode.get("creative_notes", "")
-            if not notes.strip():
-                add(scene_id, shot_id, "creative_notes", "在分集创作备注中补充角色动机与选择；此项只提示未明示信息")
+            missing = []
+            for label, key in (("动机", "motivation"), ("选择", "choice")):
+                explicit = bool(str(shot.get(key, "")).strip()) or bool(re.search(rf"(?m)^[ \t]*{label}\[{re.escape(str(shot_id))}\][ \t]*[:：][ \t]*[^\s]", notes))
+                if not explicit:
+                    missing.append(label)
+            if missing:
+                add(scene_id, shot_id, "creative_notes", f"在分集创作备注中按“{missing[0]}[{shot_id}]: 内容”格式补充{'与'.join(missing)}；只检查明示记录，不能推断隐含意图")
         previous = scene
     if scenes and not episode.get("next_expectation", "").strip():
         add(scenes[-1].get("id"), None, "next_expectation", "说明结尾希望留下的具体悬念或期待")

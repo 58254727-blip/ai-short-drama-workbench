@@ -74,11 +74,37 @@ class DialogueTests(unittest.TestCase):
         missing = review_transcript(expected, [actual[0], actual[3]])["findings"]
         self.assertEqual([("missing_speech", 1, None)], [(f["kind"], f["expected_index"], f["actual_index"]) for f in missing])
 
+    def test_untimed_negation_number_difference_retains_clues(self):
+        expected = [{"text": "不要交出三把钥匙", "speaker_id": "a"}]
+        actual = [{"text": "交出两把钥匙", "speaker_id": "a"}]
+        findings = review_transcript(expected, actual)["findings"]
+        self.assertEqual({"negation_difference", "number_difference"}, {item["kind"] for item in findings})
+        self.assertTrue(all(item["expected_index"] == item["actual_index"] == 0 and item["status"] == "machine_clue" for item in findings))
+
+    def test_untimed_insert_and_repeated_delete_keep_later_anchors(self):
+        expected = [{"text": text, "speaker_id": "a"} for text in ("开门", "不要交出三把钥匙", "关门", "关门", "回来")]
+        actual = [{"text": text, "speaker_id": "a"} for text in ("开门", "多说一句", "交出两把钥匙", "关门", "关门", "回来")]
+        findings = review_transcript(expected, actual)["findings"]
+        self.assertEqual([(None, 1)], [(item["expected_index"], item["actual_index"]) for item in findings if item["kind"] == "extra_speech"])
+        self.assertEqual({"negation_difference", "number_difference"}, {item["kind"] for item in findings if item["expected_index"] == 1})
+        deleted = review_transcript(expected, [expected[0], expected[1], expected[2], expected[4]])["findings"]
+        self.assertEqual([("missing_speech", 3, None)], [(item["kind"], item["expected_index"], item["actual_index"]) for item in deleted])
+
     def test_story_on_real_store_shape_points_to_editable_fields(self):
         episode = {"id": "ep", "creative_notes": "", "scenes": [{"id": "scene", "purpose": "出去", "location": "室内", "shots": [{"id": "shot", "story_job": "行动", "start_state": "室内", "action": "开门", "end_state": "门外", "transition": "切外景"}]}]}
         findings = review_story(episode)
         self.assertTrue(any(f["field"] == "creative_notes" and f["shot_id"] == "shot" and "动机" in f["suggestion"] for f in findings))
         self.assertFalse(any(f["field"] in {"motivation", "choice"} for f in findings))
+
+    def test_unrelated_notes_do_not_count_as_motivation_and_choice(self):
+        shot = {"id": "shot", "story_job": "行动", "start_state": "室内", "action": "开门", "end_state": "门外", "transition": "切外景"}
+        episode = {"id": "ep", "creative_notes": "场景氛围偏暗", "next_expectation": "谁来了", "scenes": [{"id": "scene", "purpose": "出去", "location": "室内", "shots": [shot]}]}
+        findings = review_story(episode)
+        self.assertTrue(any(item["field"] == "creative_notes" and item["shot_id"] == "shot" for item in findings))
+        episode["creative_notes"] = "动机[shot]: 为了救人\n选择[shot]: 推门出去"
+        self.assertFalse(any(item["field"] == "creative_notes" and item["shot_id"] == "shot" for item in review_story(episode)))
+        episode["creative_notes"] = "动机[shot]:\n选择[shot]: 推门出去"
+        self.assertTrue(any(item["field"] == "creative_notes" and item["shot_id"] == "shot" and "动机" in item["suggestion"] for item in review_story(episode)))
 
     def test_asr_local_runtime_errors_are_actionable_domain_errors(self):
         with tempfile.TemporaryDirectory() as folder:

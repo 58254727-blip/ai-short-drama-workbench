@@ -42,9 +42,9 @@ def review_transcript(expected: list[dict], actual: list[dict]) -> dict:
                 unmatched_expected.discard(e_index)
                 unmatched_actual.discard(a_index)
         else:
-            candidates = sorted(((overlap(expected[e], actual[a]), e, a) for e in range(e_start, e_end) for a in range(a_start, a_end)), reverse=True)
-            for duration, e_index, a_index in candidates:
-                if duration > 0 and e_index in unmatched_expected and a_index in unmatched_actual:
+            candidates = sorted(((overlap(expected[e], actual[a]), SequenceMatcher(None, expected[e]["text"].strip(), actual[a]["text"].strip(), autojunk=False).ratio(), e, a) for e in range(e_start, e_end) for a in range(a_start, a_end)), reverse=True)
+            for duration, similarity, e_index, a_index in candidates:
+                if (duration > 0 or similarity >= 0.55) and e_index in unmatched_expected and a_index in unmatched_actual:
                     pairs.append((e_index, a_index))
                     unmatched_expected.remove(e_index)
                     unmatched_actual.remove(a_index)
