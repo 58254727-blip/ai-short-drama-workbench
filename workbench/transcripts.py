@@ -1,7 +1,7 @@
 """Conservative dialogue comparison and explicitly local CPU transcription."""
 
 import json
-import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .domain import DomainError, require
@@ -22,24 +22,47 @@ def review_transcript(expected: list[dict], actual: list[dict]) -> dict:
     def flag(kind, expected_index=None, actual_index=None, detail=""):
         findings.append({"kind": kind, "expected_index": expected_index, "actual_index": actual_index, "detail": detail, "status": "machine_clue", "human_reviewed": False})
 
-    for index in range(max(len(expected), len(actual))):
-        if index >= len(expected):
-            flag("extra_speech", None, index, "实录多于原文；请听审")
-            continue
-        if index >= len(actual):
-            flag("missing_speech", index, None, "原文没有对应实录；请听审")
-            continue
-        source, heard = expected[index], actual[index]
-        require(all(isinstance(line, dict) and isinstance(line.get("text"), str) and isinstance(line.get("speaker_id"), str) for line in (source, heard)), "invalid_transcript", 400, "对白行格式无效")
+    require(all(isinstance(line, dict) and isinstance(line.get("text"), str) and isinstance(line.get("speaker_id"), str) for line in expected + actual), "invalid_transcript", 400, "对白行格式无效")
+
+    def overlap(left, right):
+        a, b = left.get("start_ms"), left.get("end_ms")
+        c, d = right.get("start_ms"), right.get("end_ms")
+        if not all(type(value) is int for value in (a, b, c, d)):
+            return 0
+        return max(0, min(b, d) - max(a, c))
+
+    pairs = []
+    unmatched_expected = set(range(len(expected)))
+    unmatched_actual = set(range(len(actual)))
+    matcher = SequenceMatcher(None, [line["text"].strip() for line in expected], [line["text"].strip() for line in actual], autojunk=False)
+    for tag, e_start, e_end, a_start, a_end in matcher.get_opcodes():
+        if tag == "equal":
+            for e_index, a_index in zip(range(e_start, e_end), range(a_start, a_end)):
+                pairs.append((e_index, a_index))
+                unmatched_expected.discard(e_index)
+                unmatched_actual.discard(a_index)
+        else:
+            candidates = sorted(((overlap(expected[e], actual[a]), e, a) for e in range(e_start, e_end) for a in range(a_start, a_end)), reverse=True)
+            for duration, e_index, a_index in candidates:
+                if duration > 0 and e_index in unmatched_expected and a_index in unmatched_actual:
+                    pairs.append((e_index, a_index))
+                    unmatched_expected.remove(e_index)
+                    unmatched_actual.remove(a_index)
+    for index in sorted(unmatched_expected):
+        flag("missing_speech", index, None, "原文没有对应实录；请听审")
+    for index in sorted(unmatched_actual):
+        flag("extra_speech", None, index, "实录多于原文；请听审")
+    for e_index, a_index in sorted(pairs):
+        source, heard = expected[e_index], actual[a_index]
         if heard["speaker_id"] != source["speaker_id"] or heard["speaker_id"].lower() in {"unknown", "?", ""}:
-            flag("unknown_speaker", index, index, "说话人需要人工确认")
+            flag("unknown_speaker", e_index, a_index, "说话人需要人工确认")
         original, observed = source["text"], heard["text"]
         if _tokens(original, _NEGATIONS) != _tokens(observed, _NEGATIONS):
-            flag("negation_difference", index, index, "否定词不一致，需听审")
+            flag("negation_difference", e_index, a_index, "否定词不一致，需听审")
         if _tokens(original, _NUMBERS) != _tokens(observed, _NUMBERS):
-            flag("number_difference", index, index, "数字不一致，需听审")
-        if original != observed and not any(f["expected_index"] == index and f["kind"] in {"negation_difference", "number_difference"} for f in findings):
-            flag("uncertain_wording", index, index, "文字不一致，可能是近音或识别偏差")
+            flag("number_difference", e_index, a_index, "数字不一致，需听审")
+        if original != observed and not any(f["expected_index"] == e_index and f["kind"] in {"negation_difference", "number_difference"} for f in findings):
+            flag("uncertain_wording", e_index, a_index, "文字不一致，可能是近音或识别偏差")
     return {"expected": expected, "actual": actual, "findings": findings, "human_reviewed": False}
 
 
@@ -60,6 +83,11 @@ def transcribe_offline(audio_path: Path, config_path: Path) -> list[dict]:
         from faster_whisper import WhisperModel
     except ImportError as error:
         raise DomainError("asr_dependency_missing", 503, "请在本地安装 faster-whisper 运行时") from error
-    model = WhisperModel(str(model_path), device="cpu", compute_type="int8", cpu_threads=2, local_files_only=True)
-    segments, _ = model.transcribe(str(source), beam_size=1, vad_filter=False)
-    return [{"start_ms": round(segment.start * 1000), "end_ms": round(segment.end * 1000), "text": segment.text.strip(), "speaker_id": "unknown", "status": "machine_clue"} for segment in segments]
+    except Exception:
+        raise DomainError("asr_runtime_failed", 502, "本地离线识别失败；请检查模型、音频和运行时配置") from None
+    try:
+        model = WhisperModel(str(model_path), device="cpu", compute_type="int8", cpu_threads=2, local_files_only=True)
+        segments, _ = model.transcribe(str(source), beam_size=1, vad_filter=False)
+        return [{"start_ms": round(segment.start * 1000), "end_ms": round(segment.end * 1000), "text": segment.text.strip(), "speaker_id": "unknown", "status": "machine_clue"} for segment in segments]
+    except Exception:
+        raise DomainError("asr_runtime_failed", 502, "本地离线识别失败；请检查模型、音频和运行时配置") from None

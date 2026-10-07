@@ -1,9 +1,12 @@
 """Dialogue and story review behavior, without pretending ASR is a human ear."""
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 from workbench.domain import DomainError
 from workbench.transcripts import review_transcript, transcribe_offline
@@ -60,8 +63,48 @@ class DialogueTests(unittest.TestCase):
         ]}
         findings = review_story(episode)
         self.assertTrue(any(f["scene_id"] == "s2" and f["field"] == "transition" for f in findings))
-        self.assertTrue(any(f["shot_id"] == "a" and f["field"] == "motivation" for f in findings))
-        self.assertTrue(any(f["shot_id"] == "a" and f["field"] == "choice" for f in findings))
+        self.assertTrue(any(f["shot_id"] == "a" and f["field"] == "creative_notes" and "动机" in f["suggestion"] for f in findings))
+        self.assertFalse(any(f["field"] in {"motivation", "choice"} for f in findings))
+
+    def test_inserted_and_missing_middle_lines_do_not_shift_later_matches(self):
+        expected = [{"text": text, "speaker_id": "a", "start_ms": start, "end_ms": start + 500} for text, start in [("开门", 0), ("不要走", 1000), ("回来", 2000)]]
+        actual = [{"text": text, "speaker_id": "a", "start_ms": start, "end_ms": start + 500} for text, start in [("开门", 0), ("多说一句", 500), ("不要走", 1000), ("回来", 2000)]]
+        findings = review_transcript(expected, actual)["findings"]
+        self.assertEqual([("extra_speech", None, 1)], [(f["kind"], f["expected_index"], f["actual_index"]) for f in findings])
+        missing = review_transcript(expected, [actual[0], actual[3]])["findings"]
+        self.assertEqual([("missing_speech", 1, None)], [(f["kind"], f["expected_index"], f["actual_index"]) for f in missing])
+
+    def test_story_on_real_store_shape_points_to_editable_fields(self):
+        episode = {"id": "ep", "creative_notes": "", "scenes": [{"id": "scene", "purpose": "出去", "location": "室内", "shots": [{"id": "shot", "story_job": "行动", "start_state": "室内", "action": "开门", "end_state": "门外", "transition": "切外景"}]}]}
+        findings = review_story(episode)
+        self.assertTrue(any(f["field"] == "creative_notes" and f["shot_id"] == "shot" and "动机" in f["suggestion"] for f in findings))
+        self.assertFalse(any(f["field"] in {"motivation", "choice"} for f in findings))
+
+    def test_asr_local_runtime_errors_are_actionable_domain_errors(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model = root / "model"
+            model.mkdir()
+            audio = root / "sample.wav"
+            audio.write_bytes(b"test")
+            config = root / "asr.json"
+            config.write_text(json.dumps({"runtime": "faster_whisper", "model_path": str(model)}), encoding="utf-8")
+            fake = ModuleType("faster_whisper")
+            def fail_load(*args, **kwargs):
+                raise RuntimeError("private model path and token")
+            fake.WhisperModel = fail_load
+            with patch.dict(sys.modules, {"faster_whisper": fake}), self.assertRaises(DomainError) as caught:
+                transcribe_offline(audio, config)
+            self.assertEqual("asr_runtime_failed", caught.exception.code)
+            self.assertNotIn("token", caught.exception.message)
+            def fail_iteration():
+                raise RuntimeError("private iterator secret")
+                yield None
+            fake.WhisperModel = lambda *args, **kwargs: SimpleNamespace(transcribe=lambda *args, **kwargs: (fail_iteration(), None))
+            with patch.dict(sys.modules, {"faster_whisper": fake}), self.assertRaises(DomainError) as caught:
+                transcribe_offline(audio, config)
+            self.assertEqual("asr_runtime_failed", caught.exception.code)
+            self.assertNotIn("secret", caught.exception.message)
 
 
 if __name__ == "__main__":

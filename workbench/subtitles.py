@@ -46,7 +46,19 @@ class SubtitleService:
             saved = conn.execute("SELECT timeline_version FROM subtitle_sets WHERE episode_id=?", (episode_id,)).fetchone()
             timeline = conn.execute("SELECT version FROM episode_timelines WHERE episode_id=?", (episode_id,)).fetchone()
             items = _items(conn, episode_id)
-            selected = all(conn.execute("SELECT 1 FROM shots WHERE id=? AND episode_id=? AND selected_candidate_id=?", (item["shot_id"], episode_id, item["source_asset_id"])).fetchone() for item in items)
+            selected = True
+            for item in items:
+                if not conn.execute("SELECT 1 FROM shots WHERE id=? AND episode_id=? AND selected_candidate_id=?", (item["shot_id"], episode_id, item["source_asset_id"])).fetchone():
+                    selected = False
+                    break
+                asset = self.store._row(conn, "assets", item["source_asset_id"])
+                try:
+                    valid_binary = _matches_hash(_asset_path(self.store.data_root, asset), asset["sha256"])
+                except DomainError:
+                    valid_binary = False
+                if not valid_binary:
+                    selected = False
+                    break
             status = "needs_entry" if saved is None else "ready" if timeline and saved["timeline_version"] == timeline["version"] and selected else "needs_realign"
             return {"episode_id": episode_id, "revision": episode["revision"], "status": status, "human_reviewed": False, "cues": _cues(conn, episode_id)}
 
@@ -63,7 +75,7 @@ class SubtitleService:
                 require(conn.execute("SELECT 1 FROM shots WHERE id=? AND episode_id=? AND selected_candidate_id=?", (item["shot_id"], episode_id, item["source_asset_id"])).fetchone(), "timeline_stale", 409, "选片已变化，请重新对齐时间轴")
                 asset = self.store._row(conn, "assets", item["source_asset_id"])
                 require(_matches_hash(_asset_path(self.store.data_root, asset), asset["sha256"]), "asset_hash_mismatch", 409, "素材文件哈希变化")
-            speakers = {line["speaker_id"] for shot in conn.execute("SELECT shots.dialogue FROM shots JOIN timeline_items ON shots.id=timeline_items.shot_id WHERE timeline_items.episode_id=?", (episode_id,)) for line in json.loads(shot["dialogue"])}
+            speakers_by_shot = {row["id"]: {line["speaker_id"] for line in json.loads(row["dialogue"])} for row in conn.execute("SELECT id,dialogue FROM shots WHERE episode_id=?", (episode_id,))}
             segments = list(_segments(items))
             previous_end = -1
             existing_ids = {row["id"] for row in conn.execute("SELECT id FROM subtitle_cues WHERE episode_id=?", (episode_id,))}
@@ -76,8 +88,9 @@ class SubtitleService:
                 previous_end = end
                 require(end <= segments[-1][1], "cue_out_of_range", 400, "字幕超出整集实际片段时长")
                 require(isinstance(cue["text"], str) and bool(cue["text"].strip()), "invalid_cue", 400, "字幕文本不能为空")
-                require(cue["speaker_id"] in speakers, "unknown_speaker", 400, "字幕说话人未见于已选镜头对白")
-                require(any(left <= start and end <= right and cue["source_asset_id"] == asset for left, right, asset in segments), "cue_source_mismatch", 409, "字幕来源与覆盖片段不匹配")
+                covering = next((position for position, (left, right, asset) in enumerate(segments) if left <= start and end <= right and cue["source_asset_id"] == asset), None)
+                require(covering is not None, "cue_source_mismatch", 409, "字幕来源与覆盖片段不匹配")
+                require(cue["speaker_id"] in speakers_by_shot.get(items[covering]["shot_id"], set()), "unknown_speaker", 400, "字幕说话人未见于当前片段镜头对白")
                 cue_id = cue.get("id") or str(uuid4())
                 require(cue.get("id") is None or cue_id in existing_ids, "invalid_cue_id", 400, "字幕 ID 不属于当前分集")
                 require(cue_id not in {entry[0] for entry in checked}, "invalid_cue_id", 400, "字幕 ID 重复")

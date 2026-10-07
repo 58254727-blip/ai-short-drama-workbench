@@ -90,6 +90,25 @@ class SubtitleTests(unittest.TestCase):
             self.subtitles.save_cues(self.episode["id"], [self.cue()], self.saved_timeline["revision"])
         self.assertEqual("asset_hash_mismatch", caught.exception.code)
 
+    def test_speaker_must_belong_to_covering_shot_not_other_timeline_shot(self):
+        second = self.store.save_shot(self.episode["id"], {"dialogue": [{"speaker_id": "b", "text": "走吧"}]})
+        second = self.store.select_candidate(second["id"], self.asset["id"], second["revision"])
+        timeline = self.timeline.save_timeline(self.episode["id"], [
+            {"shot_id": self.shot["id"], "source_asset_id": self.asset["id"], "in_ms": 0, "out_ms": 500},
+            {"shot_id": second["id"], "source_asset_id": self.asset["id"], "in_ms": 500, "out_ms": 1000},
+        ], self.saved_timeline["revision"])
+        with self.assertRaises(DomainError) as caught:
+            self.subtitles.save_cues(self.episode["id"], [self.cue(100, 300, speaker="b")], timeline["revision"])
+        self.assertEqual("unknown_speaker", caught.exception.code)
+        self.assertEqual([], self.subtitles.get_cues(self.episode["id"])["cues"])
+
+    def test_saved_cues_become_stale_after_source_binary_changes(self):
+        saved = self.subtitles.save_cues(self.episode["id"], [self.cue()], self.saved_timeline["revision"])
+        (self.root / "assets" / self.asset["sha256"]).write_bytes(b"tampered")
+        result = self.subtitles.get_cues(self.episode["id"])
+        self.assertEqual("needs_realign", result["status"])
+        self.assertEqual(saved["cues"], result["cues"])
+
     def test_srt_unicode_and_no_markup_injection(self):
         path = self.root / "captions.srt"
         write_srt([{**self.cue(), "text": "你好 <b>世界</b>"}], path)

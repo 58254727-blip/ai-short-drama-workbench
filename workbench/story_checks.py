@@ -22,9 +22,9 @@ def review_story(episode: dict) -> list[dict]:
             for field, message in (("story_job", "写明镜头的叙事任务或人物选择"), ("start_state", "写明动作前状态"), ("action", "写明可见行动及动机"), ("end_state", "写明行动造成的结果"), ("transition", "写明通往下一镜的线索")):
                 if not shot.get(field, "").strip():
                     add(scene_id, shot_id, field, message)
-            for field, message in (("motivation", "写明角色为何采取行动"), ("choice", "写明角色在何处做出选择")):
-                if field in shot and not shot.get(field, "").strip():
-                    add(scene_id, shot_id, field, message)
+            notes = episode.get("creative_notes", "")
+            if not notes.strip():
+                add(scene_id, shot_id, "creative_notes", "在分集创作备注中补充角色动机与选择；此项只提示未明示信息")
         previous = scene
     if scenes and not episode.get("next_expectation", "").strip():
         add(scenes[-1].get("id"), None, "next_expectation", "说明结尾希望留下的具体悬念或期待")
