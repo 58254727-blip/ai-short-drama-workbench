@@ -15,3 +15,7 @@ button{border:1px solid var(--line);border-radius:6px;background:#202b30;padding
 .sidebar button,.top-settings{display:flex;align-items:center;gap:10px}.sidebar svg,.top-settings svg{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.top-settings svg{width:17px;height:17px}
 .dialogue-row{display:grid;grid-template-columns:1fr 1fr 1.5fr 38px;gap:6px;margin:6px 0}.dialogue-row>*{min-width:0}.dialogue-row button{padding:0}
 @media(max-width:640px){.dialogue-row{grid-template-columns:1fr 1fr 38px}.dialogue-row .dialogue-text{grid-column:1/3;grid-row:2}}
+.compact select{font-size:14px;line-height:1.35}
+.inspector .actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.inspector .actions button{width:100%;min-width:0;white-space:nowrap;padding-inline:10px}
+@media(max-width:380px){.inspector .actions{grid-template-columns:1fr}}

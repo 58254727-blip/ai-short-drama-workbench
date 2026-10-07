@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines} from '../web/state.js';
+import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from '../web/state.js';
 
 test('per-shot motivation and choice preserve unrelated creative notes', () => {
   const original = '人物关系待定\n动机[shot-a]: 旧动机\n选择[shot-b]: 别的镜头';
@@ -45,4 +45,14 @@ test('multiple native dialogue lines retain speaker names and reject partial row
 
 test('manual transcript lines preserve different named speakers', () => {
   assert.deepEqual(parseTranscriptLines('访客：有人吗\n屋内人: 进来', '访客'), [{speaker_id:'访客',text:'有人吗'},{speaker_id:'屋内人',text:'进来'}]);
+});
+
+test('review selection uses the visible second shot and its own timeline source', () => {
+  const shots = [{id:'first',dialogue:[{speaker_id:'甲',text:'一'}]},{id:'second',dialogue:[{speaker_id:'乙',text:'二'}]}];
+  const items = [{shot_id:'first',source_asset_id:'video-a'},{shot_id:'second',source_asset_id:'video-b'}];
+  const selected = selectReviewContext(shots, items, 'second');
+  assert.equal(selected.shot.id, 'second');
+  assert.equal(selected.item.source_asset_id, 'video-b');
+  assert.equal(selected.shot.dialogue[0].speaker_id, '乙');
+  assert.equal(timelineOffsetForShot([{shot_id:'first',in_ms:200,out_ms:1200},{shot_id:'second',in_ms:0,out_ms:800}], 'second'), 1000);
 });

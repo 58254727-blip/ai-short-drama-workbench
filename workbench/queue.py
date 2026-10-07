@@ -176,6 +176,22 @@ class Queue:
             require(row["state"] in BUSY, "invalid_state", 409, "任务未运行或待核对")
             conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", (_stamp(_now() + timedelta(seconds=60)), job_id))
 
+    def validate_reconcile_proof(self, job_id: str, claim_token: str, started_at: str, finished_at: str) -> dict:
+        """Read-only proof and ownership gate before collecting external outputs."""
+        started = _observed_utc(started_at, "执行开始")
+        finished = _observed_utc(finished_at, "执行结束")
+        require(finished >= started, "invalid_timestamp", 400, "执行结束早于开始")
+        with self.store.connection() as conn:
+            row = self._row(conn, job_id)
+            self._owned(row, claim_token)
+            require(row["resource"] == "gpu" and row["state"] == "needs_reconcile" and row["external_id"] is not None,
+                    "invalid_state", 409, "任务没有可核对的外部执行")
+            phase = conn.execute("SELECT entered_at FROM job_phases WHERE job_id=? AND exited_at IS NULL AND interrupted_at IS NULL ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+            require(phase is not None and started >= datetime.fromisoformat(phase["entered_at"]), "invalid_timestamp", 400, "执行开始早于任务领取")
+            if row["execution_started_at"] is not None:
+                require(datetime.fromisoformat(row["execution_started_at"]) == started, "execution_conflict", 409, "执行开始时间冲突")
+            return self._job(conn, row)
+
     def mark_submission_attempt(self, job_id: str, claim_token: str) -> None:
         """Persist intent immediately before sending a provider request."""
         with self.store.transaction() as conn:

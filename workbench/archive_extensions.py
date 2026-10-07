@@ -1,5 +1,6 @@
 """Known persistent postproduction records included in portable archives."""
 
+import json
 import sqlite3
 
 from .domain import DomainError, require
@@ -61,7 +62,7 @@ def validate_extensions(trial_store, extension, project_id):
                     require(speech == (None, None) or all(type(value) is int for value in speech) and 0 <= speech[0] < speech[1], "invalid_archive", 400, "对白范围无效")
                 if table == "subtitle_cues":
                     asset = conn.execute("SELECT project_id FROM assets WHERE id=?", (row["source_asset_id"],)).fetchone()
-                    require(asset and asset["project_id"] == project_id and type(row["ordinal"]) is int and row["ordinal"] >= 0 and type(row["start_ms"]) is int and type(row["end_ms"]) is int and 0 <= row["start_ms"] < row["end_ms"] and isinstance(row["text"], str) and isinstance(row["speaker_id"], str), "invalid_archive", 400, "字幕来源或时间无效")
+                    require(asset and asset["project_id"] == project_id and type(row["ordinal"]) is int and row["ordinal"] >= 0 and type(row["start_ms"]) is int and type(row["end_ms"]) is int and 0 <= row["start_ms"] < row["end_ms"] and isinstance(row["text"], str) and bool(row["text"].strip()) and isinstance(row["speaker_id"], str) and bool(row["speaker_id"].strip()), "invalid_archive", 400, "字幕来源或时间无效")
                     saved = conn.execute("SELECT timeline_version FROM subtitle_sets WHERE episode_id=?", (row["episode_id"],)).fetchone()
                     current = conn.execute("SELECT version FROM episode_timelines WHERE episode_id=?", (row["episode_id"],)).fetchone()
                     require(saved is not None, "invalid_archive", 400, "字幕集元数据缺失")
@@ -81,5 +82,28 @@ def validate_extensions(trial_store, extension, project_id):
                     conn.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", [row[column] for column in columns])
                 except (sqlite3.IntegrityError, sqlite3.ProgrammingError, ValueError, TypeError):
                     raise DomainError("invalid_archive", 400, "后期记录关系或数据无效") from None
+        for saved in conn.execute("SELECT episode_id,timeline_version FROM subtitle_sets"):
+            episode_id = saved["episode_id"]
+            timeline = conn.execute("SELECT version FROM episode_timelines WHERE episode_id=?", (episode_id,)).fetchone()
+            require(timeline and saved["timeline_version"] <= timeline["version"], "invalid_archive", 400, "字幕引用的时间轴版本无效")
+            items = [dict(row) for row in conn.execute("SELECT shot_id,source_asset_id,in_ms,out_ms FROM timeline_items WHERE episode_id=? ORDER BY ordinal", (episode_id,))]
+            selection_current = all(conn.execute("SELECT 1 FROM shots WHERE id=? AND selected_candidate_id=?", (item["shot_id"], item["source_asset_id"])).fetchone() for item in items)
+            claimed_ready = saved["timeline_version"] == timeline["version"] and bool(items) and selection_current
+            segments = []
+            offset = 0
+            for item in items:
+                right = offset + item["out_ms"] - item["in_ms"]
+                segments.append((offset, right, item["shot_id"], item["source_asset_id"]))
+                offset = right
+            previous_end = -1
+            cues = [dict(row) for row in conn.execute("SELECT ordinal,start_ms,end_ms,speaker_id,source_asset_id FROM subtitle_cues WHERE episode_id=? ORDER BY ordinal", (episode_id,))]
+            for index, cue in enumerate(cues):
+                require(cue["ordinal"] == index and cue["start_ms"] >= previous_end, "invalid_archive", 400, "字幕顺序或重叠无效")
+                previous_end = cue["end_ms"]
+                if claimed_ready:
+                    covering = next((segment for segment in segments if segment[0] <= cue["start_ms"] and cue["end_ms"] <= segment[1] and segment[3] == cue["source_asset_id"]), None)
+                    require(covering is not None, "invalid_archive", 400, "当前字幕不属于覆盖的时间轴片段")
+                    dialogue = json.loads(conn.execute("SELECT dialogue FROM shots WHERE id=?", (covering[2],)).fetchone()["dialogue"])
+                    require(cue["speaker_id"] in {line["speaker_id"] for line in dialogue}, "invalid_archive", 400, "字幕说话人不属于覆盖的镜头")
     with trial_store.connection() as conn:
         return {table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}")] for table in EXT_TABLES}

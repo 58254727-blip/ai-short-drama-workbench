@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 from urllib.error import HTTPError
@@ -39,6 +40,11 @@ class ApiTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read())
 
+    def expire_for_reconcile(self, job_id):
+        with self.server.app.store.transaction() as conn:
+            conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", ("2000-01-01T00:00:00+00:00", job_id))
+        self.server.app.recover_expired()
+
     def test_manual_edits_persist_without_model_configuration(self):
         _, project = self.call("POST", "/api/projects", {"title": "虚构作品"})
         _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title": "第一集"})
@@ -59,6 +65,15 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(status, 403)
             self.assertIn("code", error["error"])
         self.assertEqual(self.call("GET", "/api/projects")[1], [])
+
+    def test_static_script_css_html_and_favicon_have_browser_safe_content_types(self):
+        expected = {"/app.js":"text/javascript", "/styles.css":"text/css", "/":"text/html", "/assets/rain-alley-demo.png":"image/png", "/assets/favicon.svg":"image/svg+xml", "/favicon.ico":"image/svg+xml"}
+        with patch("mimetypes.guess_type", return_value=("text/plain", None)):
+            for route, media_type in expected.items():
+                with self.subTest(route=route), urlopen(self.base + route) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers.get_content_type(), media_type)
+                    self.assertTrue(response.read())
 
     def test_invalid_fields_and_cross_project_scope_are_atomic(self):
         _, left = self.call("POST", "/api/projects", {"title": "左"})
@@ -85,6 +100,25 @@ class ApiTests(unittest.TestCase):
         status, error = self.call("PUT", f"/api/episodes/{episode['id']}", {"revision": 1, "script": "旧稿"})
         self.assertEqual(status, 409)
         self.assertEqual(error["error"]["code"], "revision_conflict")
+
+    def test_scene_goal_edit_is_scoped_revisioned_and_persistent(self):
+        _, left = self.call("POST", "/api/projects", {"title":"左"})
+        _, right = self.call("POST", "/api/projects", {"title":"右"})
+        _, episode = self.call("POST", f"/api/projects/{left['id']}/episodes", {"title":"一"})
+        _, foreign = self.call("POST", f"/api/projects/{right['id']}/episodes", {"title":"二"})
+        _, scene = self.call("POST", f"/api/episodes/{episode['id']}/scenes", {"title":"门前","purpose":"旧目标","location":"雨巷"})
+        route = f"/api/episodes/{episode['id']}/scenes/{scene['id']}"
+        status, edited = self.call("PUT", route, {"revision":1,"title":"门前","purpose":"找到屋内人","location":"雨巷"})
+        self.assertEqual(status, 200)
+        self.assertEqual(edited["purpose"], "找到屋内人")
+        self.assertEqual(self.call("GET", f"/api/episodes/{episode['id']}/scenes")[1][0]["purpose"], "找到屋内人")
+        status, conflict = self.call("PUT", route, {"revision":1,"purpose":"旧请求"})
+        self.assertEqual(status, 409)
+        self.assertEqual(conflict["error"]["code"], "revision_conflict")
+        status, foreign_error = self.call("PUT", f"/api/episodes/{foreign['id']}/scenes/{scene['id']}", {"revision":1,"purpose":"跨集"})
+        self.assertEqual(status, 409)
+        self.assertEqual(foreign_error["error"]["code"], "ownership_conflict")
+        self.assertEqual(self.call("GET", f"/api/episodes/{episode['id']}/scenes")[1][0]["purpose"], "找到屋内人")
 
     def test_upload_is_scoped_and_media_is_not_arbitrary_path(self):
         _, left = self.call("POST", "/api/projects", {"title": "甲"})
@@ -134,6 +168,33 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(result["human_reviewed"])
         self.assertTrue(result["findings"])
+
+    def test_shot_scoped_transcript_comparison_uses_selected_shot_dialogue(self):
+        _, project = self.call("POST", "/api/projects", {"title":"甲"})
+        _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title":"一"})
+        _, first = self.call("POST", f"/api/episodes/{episode['id']}/shots", {"dialogue":[{"speaker_id":"甲","text":"第一句"}]})
+        _, second = self.call("POST", f"/api/episodes/{episode['id']}/shots", {"dialogue":[{"speaker_id":"乙","text":"第二句"}]})
+        status, result = self.call("POST", f"/api/episodes/{episode['id']}/shots/{second['id']}/transcript-review", {"actual":[{"speaker_id":"乙","text":"第二句"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["expected"], [{"speaker_id":"乙","text":"第二句"}])
+        self.assertEqual(result["findings"], [])
+        self.assertNotEqual(result["expected"], first["dialogue"])
+
+    def test_two_shot_manual_review_is_scoped_to_selected_source(self):
+        _, project = self.call("POST", "/api/projects", {"title":"甲"})
+        _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title":"一"})
+        _, first = self.call("POST", f"/api/episodes/{episode['id']}/shots", {"story_job":"一"})
+        _, second = self.call("POST", f"/api/episodes/{episode['id']}/shots", {"story_job":"二"})
+        staging = self.server.app.root / "staging"
+        staging.mkdir(exist_ok=True)
+        media = staging / "synthetic.mp4"
+        media.write_bytes(b"\x00\x00\x00\x18ftypisomsynthetic")
+        asset = self.server.app.store.import_asset(project["id"], media, "video", {"source":"fixture"})
+        self.call("POST", f"/api/episodes/{episode['id']}/shots/{second['id']}/select", {"revision":1,"asset_id":asset["id"]})
+        status, reviews = self.call("POST", f"/api/episodes/{episode['id']}/shots/{second['id']}/qc", {"asset_id":asset["id"],"verdict":"pass","note":"第二镜已看"})
+        self.assertEqual(status, 200)
+        self.assertEqual([row["shot_id"] for row in reviews], [second["id"]])
+        self.assertEqual(self.call("POST", f"/api/episodes/{episode['id']}/shots/{first['id']}/qc", {"asset_id":asset["id"],"verdict":"pass","note":"错误镜头"})[0], 409)
 
     def test_unconfigured_asr_does_not_queue_and_foreign_probe_is_rejected(self):
         _, left = self.call("POST", "/api/projects", {"title": "甲"})
@@ -200,6 +261,7 @@ class ApiTests(unittest.TestCase):
         self.server.app.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
         self.server.app.queue.record_external(job["id"], "external-1", claimed["claim_token"])
         self.server.app.queue.fail(job["id"], "network_uncertain", "等待核对", claimed["claim_token"])
+        self.expire_for_reconcile(job["id"])
         time.sleep(0.01)
         stamp = datetime.now(timezone.utc).isoformat()
         png = (Path(__file__).parent.parent / "web" / "assets" / "rain-alley-demo.png").read_bytes()
@@ -208,12 +270,25 @@ class ApiTests(unittest.TestCase):
                 return {"state":"succeeded","started_at":stamp,"finished_at":stamp}
             def collect(self, prompt_id):
                 return [{"filename":"frame.png","content":png}]
-        result = self.server.app.resolve_known(self.server.app.queue.get_job(job["id"]), FakeAdapter())
+        gate = threading.Barrier(3)
+        results, errors = [], []
+        def attempt():
+            gate.wait()
+            try:
+                results.append(self.server.app.resolve_known(self.server.app.queue.get_job(job["id"]), FakeAdapter()))
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for thread in threads: thread.start()
+        gate.wait()
+        for thread in threads: thread.join()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].code, "invalid_state")
+        result = results[0]
         self.assertEqual(result["state"], "succeeded")
         self.assertEqual(len(self.server.app.store.list_assets(project["id"])), 1)
         self.assertEqual(result["result"]["candidate_assets"][0]["rights"]["shot_id"], shot["id"])
-        with self.assertRaises(Exception):
-            self.server.app.resolve_known(self.server.app.queue.get_job(job["id"]), FakeAdapter())
         self.assertEqual(len(self.server.app.store.list_assets(project["id"])), 1)
 
     def test_known_external_failure_needs_complete_timestamps(self):
@@ -225,6 +300,7 @@ class ApiTests(unittest.TestCase):
         self.server.app.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
         self.server.app.queue.record_external(job["id"], "external-2", claimed["claim_token"])
         self.server.app.queue.fail(job["id"], "network_uncertain", "等待核对", claimed["claim_token"])
+        self.expire_for_reconcile(job["id"])
         time.sleep(0.01)
         stamp = datetime.now(timezone.utc).isoformat()
         class FakeAdapter:
@@ -237,6 +313,85 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.server.app.queue.get_job(job["id"])["state"], "needs_reconcile")
         resolved = self.server.app.resolve_known(self.server.app.queue.get_job(job["id"]), FakeAdapter(True))
         self.assertEqual(resolved["state"], "failed")
+
+    def test_invalid_external_utc_proof_never_imports_candidate(self):
+        _, project = self.call("POST", "/api/projects", {"title":"甲"})
+        _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title":"一"})
+        _, shot = self.call("POST", f"/api/episodes/{episode['id']}/shots", {"story_job":"镜"})
+        job = self.server.app.queue.enqueue({"project_id":project["id"],"episode_id":episode["id"],"shot_id":shot["id"]},"h3",{"values":{}})
+        claimed = self.server.app.queue.claim("gpu")
+        self.server.app.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
+        self.server.app.queue.record_external(job["id"], "external-bad-time", claimed["claim_token"])
+        self.server.app.queue.fail(job["id"], "uncertain", "等待核对", claimed["claim_token"])
+        self.expire_for_reconcile(job["id"])
+        png = (Path(__file__).parent.parent / "web" / "assets" / "rain-alley-demo.png").read_bytes()
+        from workbench.domain import DomainError
+        class BadProof:
+            def status(self, prompt_id): return {"state":"succeeded","started_at":"2026-10-07T00:00:00+08:00","finished_at":"2026-10-07T00:01:00+08:00"}
+            def collect(self, prompt_id): return [{"filename":"frame.png","content":png}]
+        with self.assertRaises(DomainError): self.server.app.resolve_known(self.server.app.queue.get_job(job["id"]), BadProof())
+        self.assertEqual(self.server.app.store.list_assets(project["id"]), [])
+        self.assertEqual(self.server.app.queue.get_job(job["id"])["state"], "needs_reconcile")
+
+    def test_foreign_live_reconcile_claim_is_not_borrowed_from_database(self):
+        _, project = self.call("POST", "/api/projects", {"title":"甲"})
+        _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title":"一"})
+        _, shot = self.call("POST", f"/api/episodes/{episode['id']}/shots", {"story_job":"镜"})
+        job = self.server.app.queue.enqueue({"project_id":project["id"],"episode_id":episode["id"],"shot_id":shot["id"]},"h3",{"values":{}})
+        claimed = self.server.app.queue.claim("gpu")
+        self.server.app.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
+        self.server.app.queue.record_external(job["id"], "external-live", claimed["claim_token"])
+        self.server.app.queue.fail(job["id"], "uncertain", "等待核对", claimed["claim_token"])
+        stamp = datetime.now(timezone.utc).isoformat()
+        class Proof:
+            def status(self, prompt_id): return {"state":"failed","started_at":stamp,"finished_at":stamp}
+        from workbench.domain import DomainError
+        with self.assertRaises(DomainError) as refused:
+            self.server.app.resolve_known(self.server.app.queue.get_job(job["id"]), Proof())
+        self.assertEqual(refused.exception.code, "lease_active")
+        still = self.server.app.queue.get_job(job["id"])
+        self.assertEqual(still["claim_token"], claimed["claim_token"])
+        self.assertEqual(still["state"], "needs_reconcile")
+
+    def test_paused_app_can_reconcile_after_lease_expiry_without_starting_workers(self):
+        _, project = self.call("POST", "/api/projects", {"title":"甲"})
+        _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title":"一"})
+        _, shot = self.call("POST", f"/api/episodes/{episode['id']}/shots", {"story_job":"镜"})
+        job = self.server.app.queue.enqueue({"project_id":project["id"],"episode_id":episode["id"],"shot_id":shot["id"]},"h3",{"values":{}})
+        claimed = self.server.app.queue.claim("gpu")
+        self.server.app.queue.mark_submission_attempt(job["id"], claimed["claim_token"])
+        self.server.app.queue.record_external(job["id"], "external-paused", claimed["claim_token"])
+        self.server.app.queue.fail(job["id"], "uncertain", "等待核对", claimed["claim_token"])
+        with self.server.app.store.transaction() as conn:
+            conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", ("2000-01-01T00:00:00+00:00", job["id"]))
+        self.server.app.recover_expired()
+        self.assertFalse(self.server.app.workers)
+        self.assertNotEqual(self.server.app.queue.get_job(job["id"])["claim_token"], claimed["claim_token"])
+        stamp = datetime.now(timezone.utc).isoformat()
+        class Proof:
+            def status(self, prompt_id): return {"state":"failed","started_at":stamp,"finished_at":stamp}
+        resolved = self.server.app.resolve_known(self.server.app.queue.get_job(job["id"]), Proof())
+        self.assertEqual(resolved["state"], "failed")
+
+    def test_early_restart_only_requeues_expired_local_job_on_later_tick(self):
+        from workbench.server import App
+        _, project = self.call("POST", "/api/projects", {"title":"甲"})
+        _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title":"一"})
+        job = self.server.app.queue.enqueue({"project_id":project["id"],"episode_id":episode["id"]},"probe",{"asset_id":"synthetic","idempotent_local":True})
+        claimed = self.server.app.queue.claim("cpu")
+        second = App(self.server.app.root)
+        self.addCleanup(second.close)
+        self.assertEqual(second.queue.get_job(job["id"])["claim_token"], claimed["claim_token"])
+        self.assertEqual(second.queue.get_job(job["id"])["state"], "running")
+        with self.server.app.store.transaction() as conn:
+            conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", ("2000-01-01T00:00:00+00:00", job["id"]))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and second.queue.get_job(job["id"])["state"] != "queued":
+            time.sleep(0.05)
+        ready = second.queue.get_job(job["id"])
+        self.assertEqual(ready["state"], "queued")
+        self.assertIsNone(ready["claim_token"])
+        self.assertFalse(second.workers)
 
     def test_h3_queue_binds_current_shot_and_native_dialogue_only_when_configured(self):
         _, project = self.call("POST", "/api/projects", {"title":"甲"})

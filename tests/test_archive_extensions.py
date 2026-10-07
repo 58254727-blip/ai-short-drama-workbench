@@ -21,7 +21,7 @@ class ExtendedArchiveTests(unittest.TestCase):
         TimelineService(self.store); SubtitleService(self.store); ManualReviewService(self.store)
         self.project = self.store.create_project("虚构")
         self.episode = self.store.create_episode(self.project["id"], "第一集")
-        self.shot = self.store.save_shot(self.episode["id"], {"story_job": "开门"})
+        self.shot = self.store.save_shot(self.episode["id"], {"story_job": "开门", "dialogue": [{"speaker_id": "甲", "text": "你好"}]})
         media = self.store.data_root / "staging" / "source-media.mp4"
         media.parent.mkdir(parents=True, exist_ok=True)
         media.write_bytes(b"synthetic archive binary")
@@ -91,6 +91,31 @@ class ExtendedArchiveTests(unittest.TestCase):
                 output.writestr(name, data)
         with self.assertRaises(DomainError): restore_archive(self.target, corrupt)
         self.assertEqual(self.target.list_projects(), [])
+
+    def test_forged_ready_cues_reject_blank_speaker_order_and_overlap_atomically(self):
+        from uuid import uuid4
+        changes = {
+            "blank": lambda cues: cues[0].update(text="   "),
+            "speaker": lambda cues: cues[0].update(speaker_id="陌生人"),
+            "order": lambda cues: cues[0].update(ordinal=2),
+            "overlap": lambda cues: cues.append({**cues[0], "id": str(uuid4()), "ordinal": 1, "start_ms": 400, "end_ms": 900}),
+        }
+        for label, change in changes.items():
+            with self.subTest(label=label):
+                target_root = Path(self.temp.name) / f"target-{label}"
+                target = Store(target_root / "target.sqlite", target_root)
+                corrupt = Path(self.temp.name) / f"forged-{label}.zip"
+                with zipfile.ZipFile(self.archive) as source, zipfile.ZipFile(corrupt, "w") as output:
+                    for name in source.namelist():
+                        data = source.read(name)
+                        if name == "metadata.json":
+                            metadata = json.loads(data)
+                            change(metadata["extensions"]["subtitle_cues"])
+                            data = json.dumps(metadata).encode()
+                        output.writestr(name, data)
+                with self.assertRaises(DomainError): restore_archive(target, corrupt)
+                self.assertEqual(target.list_projects(), [])
+                self.assertFalse((target.data_root / "assets" / self.asset["sha256"]).exists())
 
 
 if __name__ == "__main__": unittest.main()

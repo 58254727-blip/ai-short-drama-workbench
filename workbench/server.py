@@ -30,6 +30,7 @@ from .transcripts import review_transcript, transcribe_offline
 from .worker import Worker
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png"}
 MAX_JSON = 2 * 1024 * 1024
 MAX_UPLOAD = 8 * 1024 * 1024 * 1024
 MAX_RESTORE = 64 * 1024 * 1024 * 1024
@@ -75,12 +76,41 @@ class App:
         self.timeline = TimelineService(self.store)
         self.subtitles = SubtitleService(self.store)
         self.review = ManualReviewService(self.store)
-        self.queue.recover()
+        self.reconcile_lock = threading.Lock()
+        self.reconcile_tokens = {}
+        self._recover_expired_locked()
         self.config = self._config()
         self.workers = []
         self.worker_threads = []
         self.worker_lock = threading.Lock()
-        self.reconcile_lock = threading.Lock()
+        self.maintenance_stop = threading.Event()
+        self.maintenance_thread = threading.Thread(target=self._maintain_leases, daemon=True)
+        self.maintenance_thread.start()
+
+    def _recover_expired_locked(self):
+        recovered = self.queue.recover()
+        for job in recovered:
+            if job["resource"] == "gpu" and job["state"] == "needs_reconcile":
+                self.reconcile_tokens[job["id"]] = job["claim_token"]
+        return recovered
+
+    def recover_expired(self):
+        """DB-only lease maintenance; never claims work or calls a provider."""
+        with self.reconcile_lock:
+            return self._recover_expired_locked()
+
+    def _maintain_leases(self):
+        while not self.maintenance_stop.wait(5):
+            try:
+                self.recover_expired()
+            except Exception:
+                # A later tick retries; request paths still surface their own errors.
+                pass
+
+    def close(self):
+        self.maintenance_stop.set()
+        self.maintenance_thread.join(timeout=1)
+        self.stop_workers()
 
     def _config(self):
         path = self.root / "operator-config.json"
@@ -291,12 +321,15 @@ class App:
         """Complete only a known external execution with provider timestamp proof."""
         from .workflows import collect_candidates
         with self.reconcile_lock:
+            self._recover_expired_locked()
             current = self.queue.get_job(job["id"])
             require(current["state"] == "needs_reconcile" and current["external_id"], "invalid_state", 409, "外部结果未处于可核对状态")
-            token = current["claim_token"]
+            token = self.reconcile_tokens.get(current["id"])
+            require(token is not None and token == current["claim_token"], "lease_active", 409, "任务租约仍由原处理者持有；到期后再核对")
             self.queue.renew_lease(current["id"], token)
             observed = adapter.status(current["external_id"])
             require(observed["state"] in ("succeeded", "failed") and observed.get("started_at") and observed.get("finished_at"), "evidence_missing", 409, "外部尚无完整执行开始与结束证据")
+            self.queue.validate_reconcile_proof(current["id"], token, observed["started_at"], observed["finished_at"])
             if observed["state"] == "failed":
                 self.queue.record_execution_started(current["id"], observed["started_at"], token)
                 self.queue.fail(current["id"], "provider_execution_failed", "外部执行失败", token, execution_finished_at=observed["finished_at"])
@@ -310,12 +343,21 @@ class App:
                 thread.start()
                 try:
                     files = adapter.collect(current["external_id"])
+                    self.queue.renew_lease(current["id"], token)
                     candidates = collect_candidates(self.store, current, current["external_id"], files)
                     self.queue.record_execution_started(current["id"], observed["started_at"], token)
                     self.queue.finish(current["id"], {"prompt_id": current["external_id"], "candidate_assets": candidates, "execution_finished_at": observed["finished_at"]}, token, execution_finished_at=observed["finished_at"])
                 finally:
                     done.set(); thread.join()
+            self.reconcile_tokens.pop(current["id"], None)
             return self.queue.get_job(current["id"])
+
+
+class LocalServer(ThreadingHTTPServer):
+    def server_close(self):
+        if hasattr(self, "app"):
+            self.app.close()
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -395,9 +437,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self._path()
         if not path.startswith("/api/"):
             require(self.command == "GET", "method_not_allowed", 405, "此路径只可读取")
-            target = "index.html" if path == "/" else path.lstrip("/")
-            require(target in {"index.html", "styles.css", "app.js", "api.js", "state.js", "views.js", "editor.js", "production.js", "assets/rain-alley-demo.png"}, "not_found", 404, "页面不存在")
-            return self._send_file(WEB_ROOT / target, mimetypes.guess_type(target)[0] or "application/octet-stream")
+            target = "index.html" if path == "/" else "assets/favicon.svg" if path == "/favicon.ico" else path.lstrip("/")
+            require(target in {"index.html", "styles.css", "app.js", "api.js", "state.js", "views.js", "editor.js", "production.js", "assets/rain-alley-demo.png", "assets/favicon.svg"}, "not_found", 404, "页面不存在")
+            return self._send_file(WEB_ROOT / target, STATIC_TYPES[Path(target).suffix])
         app = self.server.app
         parts = path.strip("/").split("/")[1:]
         method = self.command
@@ -558,6 +600,10 @@ class Handler(BaseHTTPRequestHandler):
             if parts[2:] == ["scenes"]:
                 if method == "GET": return self._reply(200, app.store.list_scenes(episode_id))
                 if method == "POST": return self._reply(201, app.store.create_scene(episode_id, body))
+            if len(parts) == 4 and parts[2] == "scenes" and method == "PUT":
+                scene_id = _id(parts[3])
+                _fields(body, {"revision", "title", "purpose", "location"}, {"revision"})
+                return self._reply(200, app.store.update_scene(episode_id, scene_id, {key: value for key, value in body.items() if key != "revision"}, body["revision"]))
             if parts[2:] == ["shots"]:
                 if method == "GET": return self._reply(200, app.store.list_shots(episode_id))
                 if method == "POST": return self._reply(201, app.store.save_shot(episode_id, body))
@@ -569,6 +615,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply(200, app.store.save_shot(episode_id, {"id": shot["id"], **{k: v for k, v in body.items() if k != "revision"}}, body["revision"]))
             if len(parts) == 5 and parts[2] == "shots":
                 shot = app._shot(episode_id, _id(parts[3]))
+                if parts[4] == "transcript-review" and method == "POST":
+                    _fields(body, {"actual"}, {"actual"})
+                    return self._reply(200, review_transcript(shot["dialogue"], body["actual"]))
                 if parts[4] == "candidates" and method == "GET":
                     assets = app.store.list_assets(episode["project_id"])
                     return self._reply(200, [a for a in assets if a["kind"] == "video" and (not a["rights"].get("shot_id") or a["rights"].get("shot_id") == shot["id"])])
@@ -638,7 +687,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def make_server(host="127.0.0.1", port=8766, data_root=None):
     require(host == "127.0.0.1", "invalid_host", 400, "服务仅可绑定 127.0.0.1")
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = LocalServer((host, port), Handler)
     try:
         server.app = App(Path(data_root) if data_root else Path.cwd() / ".workbench-data")
     except Exception:

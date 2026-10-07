@@ -62,3 +62,18 @@ export function parseTranscriptLines(text, defaultSpeaker = '') {
       : {speaker_id:defaultSpeaker, text:trimmed};
   }).filter(line => line.text);
 }
+
+export function selectReviewContext(shots, timelineItems, selectedShotId) {
+  const shot = shots.find(item => item.id === selectedShotId) || shots[0] || null;
+  const item = shot ? (timelineItems || []).find(entry => entry.shot_id === shot.id) || null : null;
+  return {shot, item};
+}
+
+export function timelineOffsetForShot(items, shotId) {
+  let offset = 0;
+  for (const item of items || []) {
+    if (item.shot_id === shotId) return offset;
+    offset += item.out_ms - item.in_ms;
+  }
+  return null;
+}

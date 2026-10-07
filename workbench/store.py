@@ -191,6 +191,20 @@ class Store:
             self._row(conn, "episodes", episode_id)
             return [dict(row) for row in conn.execute("SELECT * FROM scenes WHERE episode_id=? ORDER BY sequence,id", (episode_id,))]
 
+    def update_scene(self, episode_id: str, scene_id: str, payload: dict, expected_episode_revision: int) -> dict:
+        payload = _object(payload, "scene")
+        require(set(payload) <= {"title", "purpose", "location"}, "invalid_payload", 400, "场景字段不受支持")
+        with self.transaction() as conn:
+            episode = dict(self._row(conn, "episodes", episode_id))
+            scene = dict(self._row(conn, "scenes", scene_id))
+            require(scene["episode_id"] == episode_id, "ownership_conflict", 409, "场景不属于当前分集")
+            require(episode["revision"] == expected_episode_revision, "revision_conflict", 409, "分集版本已变化")
+            for key, value in payload.items():
+                scene[key] = _title(value) if key == "title" else _text(value, key)
+            conn.execute("UPDATE scenes SET title=:title,purpose=:purpose,location=:location WHERE id=:id", scene)
+            conn.execute("UPDATE episodes SET revision=revision+1,updated_at=? WHERE id=?", (_now(), episode_id))
+        return {**scene, "episode_revision": episode["revision"] + 1}
+
     def _validate_shot_links(self, conn, item):
         project_id = self._project_of_episode(conn, item["episode_id"])
         if item["scene_id"] is not None:

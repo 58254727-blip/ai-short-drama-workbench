@@ -39,6 +39,25 @@ class QueueTests(unittest.TestCase):
         self.queue.record_execution_started(job["id"], started, job["claim_token"])
         return started
 
+    def test_reconcile_proof_validator_rejects_bad_utc_order_and_fenced_token(self):
+        queued = self.enqueue()
+        claimed = self.queue.claim("gpu")
+        self.queue.mark_submission_attempt(queued["id"], claimed["claim_token"])
+        self.queue.record_external(queued["id"], "known-provider-id", claimed["claim_token"])
+        self.queue.fail(queued["id"], "uncertain", "等待核对", claimed["claim_token"])
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self.assertRaises(DomainError):
+            self.queue.validate_reconcile_proof(queued["id"], claimed["claim_token"], stamp.replace("+00:00", "+08:00"), stamp)
+        with self.assertRaises(DomainError):
+            self.queue.validate_reconcile_proof(queued["id"], claimed["claim_token"], stamp, "2020-01-01T00:00:00+00:00")
+        self.assertEqual(self.queue.validate_reconcile_proof(queued["id"], claimed["claim_token"], stamp, stamp)["external_id"], "known-provider-id")
+        self.expire(queued["id"])
+        recovered = self.queue.recover()[0]
+        with self.assertRaises(DomainError) as stale:
+            self.queue.validate_reconcile_proof(queued["id"], claimed["claim_token"], stamp, stamp)
+        self.assertEqual(stale.exception.code, "stale_claim")
+        self.assertNotEqual(recovered["claim_token"], claimed["claim_token"])
+
     def test_claim_caps_gpu_at_one_across_instances(self):
         first = self.enqueue()
         second = self.enqueue()
