@@ -1,6 +1,20 @@
-# 镜序｜AI 短剧制作工作台
+# 镜序｜AI 短剧制作工作台：从剧本到成片
 
-**Jingxu — Local AI Short-Drama Workbench**
+**Jingxu — AI Short-Drama Workbench | From Script to Screen**
+
+从故事出发，把剧本、分镜、素材、字幕和剪辑连接成一条可追溯的本地制作流程。
+
+Bring scripts, storyboards, media, subtitles, and editing into one traceable local production workflow.
+
+> **创作目标 / Production goal**
+>
+> 稳定产出 10 部短剧，力争平均平台热度达到 1500 万。
+>
+> Produce 10 complete short dramas and aim for average platform-defined popularity of 15 million.
+>
+> 以上为待验证的项目目标，并非已实现业绩；具体平台及“热度”统计口径待确认，不作为播放量或效果保证。
+>
+> These are unverified project targets, not reported results. The platform and measurement method are yet to be specified; no view-count or performance guarantee is being made.
 
 镜序是一个本地运行的短剧制作桌。可以手工建立作品、分集和镜头，导入有来源记录的素材，明确选片并设置剪辑切点，编辑字幕，使用 FFmpeg 导出 MP4／SRT／机器核验报告，并制作包含作品数据与素材二进制的完整 ZIP 备份。队列只有在操作者显式启动本地处理后才领取任务。
 
