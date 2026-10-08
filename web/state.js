@@ -21,6 +21,27 @@ export function mergeShotNotes(notes, shotId, motivation, choice) {
   return lines.join('\n');
 }
 
+function noteValue(notes, label) {
+  const prefix = label;
+  for (const line of String(notes || '').split(/\r?\n/)) {
+    if (line.startsWith(prefix) && /^\s*[:：]/.test(line.slice(prefix.length))) return line.slice(prefix.length).replace(/^\s*[:：]/, '').trim();
+  }
+  return '';
+}
+
+function mergeLabelNote(notes, label, value) {
+  const lines = String(notes || '').split(/\r?\n/).filter(line => !(line.startsWith(label) && /^\s*[:：]/.test(line.slice(label.length))));
+  while (lines.length && !lines.at(-1)) lines.pop();
+  if (String(value).trim()) lines.push(`${label}: ${String(value).trim()}`);
+  return lines.join('\n');
+}
+
+export const readEpisodeExpectation = notes => noteValue(notes, '续集期待');
+export const mergeEpisodeExpectation = (notes, value) => mergeLabelNote(notes, '续集期待', value);
+export const readSceneTime = (notes, sceneId) => noteValue(notes, `场景时间[${sceneId}]`);
+export const mergeSceneTime = (notes, sceneId, value) => mergeLabelNote(notes, `场景时间[${sceneId}]`, value);
+export const isStructuredNoteLine = line => /^\s*(?:动机|选择|场景时间)\[[^\]]+\]\s*[:：]|^\s*续集期待\s*[:：]/.test(line);
+
 export function buildTimelineItem(shot, inMs, outMs) {
   if (!shot?.selected_candidate_id) throw new Error('请先为镜头选片');
   if (!Number.isInteger(inMs) || !Number.isInteger(outMs) || inMs < 0 || outMs <= inMs) throw new Error('切点必须是有效的起止毫秒');

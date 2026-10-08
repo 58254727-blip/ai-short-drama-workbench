@@ -302,24 +302,26 @@ class Store:
             conn.execute("UPDATE shots SET selected_candidate_id=?,revision=?,updated_at=? WHERE id=?", (asset_id, item["revision"], item["updated_at"], shot_id))
         return item
 
-    def export_project(self, project_id: str) -> dict:
-        with self.connection() as conn:
-            conn.execute("BEGIN")
-            try:
-                project = dict(self._row(conn, "projects", project_id))
-                episodes = [dict(r) for r in conn.execute("SELECT * FROM episodes WHERE project_id=? ORDER BY id", (project_id,))]
-                scenes = [dict(r) for r in conn.execute("SELECT scenes.* FROM scenes JOIN episodes ON episodes.id=scenes.episode_id WHERE episodes.project_id=? ORDER BY scenes.id", (project_id,))]
-                shots = [self._shot(r) for r in conn.execute("SELECT shots.* FROM shots JOIN episodes ON episodes.id=shots.episode_id WHERE episodes.project_id=? ORDER BY shots.id", (project_id,))]
-                assets = []
-                for row in conn.execute("SELECT * FROM assets WHERE project_id=? ORDER BY id", (project_id,)):
-                    asset = self._asset(row)
-                    asset.pop("binary_available")
-                    asset.pop("storage_key")
-                    asset["binary_status"] = "external_binary_required"
-                    assets.append(asset)
-                return {"format_version": 1, "project": project, "episodes": episodes, "scenes": scenes, "shots": shots, "assets": assets}
-            finally:
-                conn.rollback()
+    def export_project(self, project_id: str, conn=None) -> dict:
+        if conn is None:
+            with self.connection() as owned:
+                owned.execute("BEGIN")
+                try:
+                    return self.export_project(project_id, owned)
+                finally:
+                    owned.rollback()
+        project = dict(self._row(conn, "projects", project_id))
+        episodes = [dict(r) for r in conn.execute("SELECT * FROM episodes WHERE project_id=? ORDER BY id", (project_id,))]
+        scenes = [dict(r) for r in conn.execute("SELECT scenes.* FROM scenes JOIN episodes ON episodes.id=scenes.episode_id WHERE episodes.project_id=? ORDER BY scenes.id", (project_id,))]
+        shots = [self._shot(r) for r in conn.execute("SELECT shots.* FROM shots JOIN episodes ON episodes.id=shots.episode_id WHERE episodes.project_id=? ORDER BY shots.id", (project_id,))]
+        assets = []
+        for row in conn.execute("SELECT * FROM assets WHERE project_id=? ORDER BY id", (project_id,)):
+            asset = self._asset(row)
+            asset.pop("binary_available")
+            asset.pop("storage_key")
+            asset["binary_status"] = "external_binary_required"
+            assets.append(asset)
+        return {"format_version": 1, "project": project, "episodes": episodes, "scenes": scenes, "shots": shots, "assets": assets}
 
     def restore_project(self, bundle: dict) -> dict:
         bundle = _object(bundle, "bundle")

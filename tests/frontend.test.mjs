@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot, restoreArchiveFile, refreshProjectSelection} from '../web/state.js';
+import {mergeShotNotes, splitShotNotes, readEpisodeExpectation, mergeEpisodeExpectation, readSceneTime, mergeSceneTime, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot, restoreArchiveFile, refreshProjectSelection} from '../web/state.js';
 import {asciiJsonHeader} from '../web/api.js';
 
 test('per-shot motivation and choice preserve unrelated creative notes', () => {
@@ -14,6 +14,17 @@ test('fullwidth separators are edited without duplicate shot notes', () => {
   const old = '动机[shot-a]：旧动机\n选择[shot-a]：旧选择\n自由备注';
   assert.deepEqual(splitShotNotes(old, 'shot-a'), {motivation:'旧动机', choice:'旧选择'});
   assert.equal(mergeShotNotes(old, 'shot-a', '新动机', '新选择'), '自由备注\n动机[shot-a]: 新动机\n选择[shot-a]: 新选择');
+});
+
+test('expectation and scene time can be filled and cleared without erasing other Chinese notes', () => {
+  const original = '自由备注\n动机[shot-a]: 找人\n场景时间[scene-a]：夜\n续集期待：谁在敲门';
+  assert.equal(readEpisodeExpectation(original), '谁在敲门');
+  assert.equal(readSceneTime(original, 'scene-a'), '夜');
+  const changed = mergeSceneTime(mergeEpisodeExpectation(original, '下一集找到钥匙'), 'scene-a', '清晨');
+  assert.equal(readEpisodeExpectation(changed), '下一集找到钥匙');
+  assert.equal(readSceneTime(changed, 'scene-a'), '清晨');
+  const cleared = mergeSceneTime(mergeEpisodeExpectation(changed, ''), 'scene-a', '');
+  assert.equal(cleared, '自由备注\n动机[shot-a]: 找人');
 });
 
 test('actual timeline item uses selected media and nonzero trim', () => {

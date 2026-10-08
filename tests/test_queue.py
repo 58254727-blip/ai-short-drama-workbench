@@ -289,6 +289,42 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(interrupted["duration_ms"])
         self.assertIsNotNone(interrupted["interrupted_at"])
 
+    def test_uncertain_cpu_text_requires_local_owned_ack_and_keeps_audit(self):
+        text = self.enqueue("text")
+        self.enqueue("text", {"plan_revision": 2, "strategy": "second"})
+        self.enqueue("text", {"plan_revision": 3, "strategy": "third"})
+        claimed = self.queue.claim("cpu")
+        self.queue.claim("cpu")
+        self.expire(claimed["id"])
+        self.queue.recover()
+        recovered = self.queue.get_job(text["id"])
+        self.assertEqual(recovered["state"], "needs_reconcile")
+        with self.assertRaises(DomainError):
+            self.queue.settle_uncertain_text(text["id"], claimed["claim_token"], True, "已人工检查本地记录")
+        with self.assertRaises(DomainError):
+            self.queue.settle_uncertain_text(text["id"], recovered["claim_token"], False, "已人工检查本地记录")
+        self.assertIsNone(self.queue.claim("cpu"))
+        settled = self.queue.settle_uncertain_text(text["id"], recovered["claim_token"], True, "用户确认状态不明，停止本地等待")
+        self.assertEqual(settled["state"], "failed")
+        self.assertEqual(settled["failure_code"], "manual_unverified")
+        self.assertEqual(settled["manual_settlement"]["note"], "用户确认状态不明，停止本地等待")
+        self.assertEqual(settled["source_snapshot"], text["source_snapshot"])
+        self.assertIsNotNone(self.queue.claim("cpu"))
+
+    def test_manual_text_settlement_never_releases_gpu_or_nontext_cpu(self):
+        gpu = self.enqueue("h3")
+        self.queue.claim("gpu")
+        probe = self.enqueue("probe")
+        self.queue.claim("cpu")
+        for job in (gpu, probe):
+            self.expire(job["id"])
+        self.queue.recover()
+        for job in (gpu, probe):
+            current = self.queue.get_job(job["id"])
+            with self.assertRaises(DomainError):
+                self.queue.settle_uncertain_text(job["id"], current["claim_token"], True, "人工确认")
+            self.assertEqual(self.queue.get_job(job["id"])["state"], "needs_reconcile")
+
     def test_cpu_probe_without_idempotence_declaration_requires_reconcile(self):
         job = self.enqueue("probe")
         self.queue.claim("cpu")

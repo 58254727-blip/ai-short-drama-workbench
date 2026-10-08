@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from .domain import DomainError, require
+from .assets import binary_available
 
 
 KINDS = {"h3": "gpu", "text": "cpu", "asr": "cpu", "probe": "cpu", "export": "cpu"}
@@ -28,6 +29,10 @@ CREATE TABLE IF NOT EXISTS job_phases (
  phase TEXT NOT NULL, entered_at TEXT NOT NULL, exited_at TEXT, duration_ms INTEGER,
  interrupted_at TEXT);
 CREATE INDEX IF NOT EXISTS job_phases_job_idx ON job_phases(job_id,id);
+CREATE TABLE IF NOT EXISTS job_settlements (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id), acknowledgment TEXT NOT NULL,
+ note TEXT NOT NULL, prior_failure_code TEXT, prior_failure_message TEXT,
+ settled_at TEXT NOT NULL);
 """
 SHELL_KEYS = {"command", "cmd", "shell", "argv", "executable", "subprocess", "script"}
 
@@ -91,6 +96,8 @@ class Queue:
         item["payload"] = json.loads(item["payload"])
         item["source_snapshot"] = json.loads(item["source_snapshot"])
         item["result"] = json.loads(item["result"]) if item["result"] is not None else None
+        settlement = conn.execute("SELECT acknowledgment,note,prior_failure_code,prior_failure_message,settled_at FROM job_settlements WHERE job_id=?", (item["id"],)).fetchone()
+        item["manual_settlement"] = dict(settlement) if settlement else None
         item["phases"] = [dict(phase) for phase in conn.execute(
             "SELECT phase,entered_at,exited_at,duration_ms,interrupted_at FROM job_phases WHERE job_id=? ORDER BY id", (item["id"],)
         )]
@@ -114,6 +121,45 @@ class Queue:
             shot_snapshot["asset_version_ids"] = json.loads(shot_snapshot["asset_version_ids"])
             return shot["revision"], {"episode": dict(episode), "shot": shot_snapshot}
         return episode["revision"], {"episode": dict(episode), "shot": None}
+
+    def _export_state(self, conn, episode_id):
+        meta = conn.execute("SELECT version FROM episode_timelines WHERE episode_id=?", (episode_id,)).fetchone()
+        items = [dict(row) for row in conn.execute("SELECT * FROM timeline_items WHERE episode_id=? ORDER BY ordinal", (episode_id,))]
+        shots = [dict(row) for row in conn.execute("SELECT id,revision,selected_candidate_id FROM shots WHERE episode_id=? ORDER BY id", (episode_id,))]
+        assets = [dict(conn.execute("SELECT id,sha256,storage_key,size_bytes FROM assets WHERE id=?", (asset_id,)).fetchone())
+                  for asset_id in sorted({item["source_asset_id"] for item in items})]
+        caption_set = conn.execute("SELECT * FROM subtitle_sets WHERE episode_id=?", (episode_id,)).fetchone()
+        cues = [dict(row) for row in conn.execute("SELECT * FROM subtitle_cues WHERE episode_id=? ORDER BY ordinal", (episode_id,))]
+        qc = [dict(row) for row in conn.execute("SELECT * FROM manual_qc WHERE episode_id=? ORDER BY reviewed_at", (episode_id,))]
+        return {"timeline_version": meta["version"] if meta else 0, "items": items, "shots": shots, "assets": assets,
+                "caption_set": dict(caption_set) if caption_set else None, "cues": cues, "manual_qc": qc}
+
+    def _checked_export_snapshot(self, conn, scope, payload):
+        revision, snapshot = self._scope(conn, scope)
+        state = self._export_state(conn, scope["episode_id"])
+        shot_by_id = {shot["id"]: shot for shot in state["shots"]}
+        require(bool(state["items"]) and all(shot_by_id.get(item["shot_id"], {}).get("selected_candidate_id") == item["source_asset_id"]
+                for item in state["items"]), "timeline_missing", 409, "时间轴选片已变化")
+        require(all(asset["storage_key"] == asset["sha256"] and binary_available(self.store.data_root, asset["sha256"])
+                    for asset in state["assets"]), "asset_hash_mismatch", 409, "导出来源素材缺失或哈希变化")
+        if payload.get("subtitles"):
+            saved = state["caption_set"]
+            current_shots = {item["shot_id"]: shot_by_id[item["shot_id"]]["revision"] for item in state["items"]}
+            require(saved is not None and saved["timeline_version"] == state["timeline_version"]
+                    and saved["shot_snapshot"] is not None and json.loads(saved["shot_snapshot"]) == current_shots
+                    and bool(state["cues"]), "captions_not_ready", 409, "字幕已过期或未填写")
+        snapshot["export"] = state
+        return revision, snapshot
+
+    def assert_export_source(self, job, conn=None):
+        scope = {key: job[key] for key in ("project_id", "episode_id", "shot_id")}
+        if conn is None:
+            with self.store.connection() as owned:
+                owned.execute("BEGIN")
+                return self.assert_export_source(job, owned)
+        _, current = self._checked_export_snapshot(conn, scope, job["payload"])
+        require(current == job["source_snapshot"], "revision_conflict", 409, "排队后镜头、时间轴、字幕或校核已变化，请重新排队")
+        return current["export"]
 
     def _phase(self, conn, job_id, name, when):
         open_phase = conn.execute("SELECT id,entered_at FROM job_phases WHERE job_id=? AND exited_at IS NULL AND interrupted_at IS NULL ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
@@ -145,7 +191,7 @@ class Queue:
         _check_no_shell(payload)
         _json(payload)
         with self.store.transaction() as conn:
-            revision, snapshot = self._scope(conn, scope)
+            revision, snapshot = self._checked_export_snapshot(conn, scope, payload) if kind == "export" else self._scope(conn, scope)
             return self._insert(conn, scope, kind, payload, revision, snapshot)
 
     def claim(self, resource: str) -> dict | None:
@@ -314,6 +360,23 @@ class Queue:
                     self._interrupt_phase(conn, row["id"], when)
                 result.append(self._job(conn, self._row(conn, row["id"])))
             return result
+
+    def settle_uncertain_text(self, job_id: str, claim_token: str, acknowledged: bool, note: str) -> dict:
+        """Operator-confirmed local failure only; no claim about the remote text request."""
+        require(acknowledged is True and isinstance(note, str) and bool(note.strip()) and len(note) <= 2000,
+                "manual_ack_required", 400, "须明确确认未知外部状态并记录本地收束说明")
+        with self.store.transaction() as conn:
+            row = self._row(conn, job_id)
+            self._owned(row, claim_token)
+            require(row["state"] == "needs_reconcile" and row["resource"] == "cpu" and row["kind"] == "text"
+                    and row["external_id"] is None, "invalid_state", 409, "仅能人工收束待核对的 CPU 文本任务")
+            when = _now()
+            conn.execute("INSERT INTO job_settlements VALUES (?,?,?,?,?,?)",
+                         (job_id, "operator_confirmed_unknown", note.strip(), row["failure_code"], row["failure_message"], _stamp(when)))
+            conn.execute("UPDATE jobs SET state='failed',failure_code='manual_unverified',failure_message=?,lease_until=NULL,claim_token=NULL,updated_at=? WHERE id=?",
+                         ("用户确认外部状态未知，仅结束本地等待；未取消外部请求或核验执行结果", _stamp(when), job_id))
+            self._phase(conn, job_id, None, when)
+            return self._job(conn, self._row(conn, job_id))
 
     def get_job(self, job_id: str) -> dict:
         with self.store.connection() as conn:

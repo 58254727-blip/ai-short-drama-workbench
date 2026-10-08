@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import zipfile
@@ -40,8 +41,14 @@ def _hash_archive(path):
 
 
 def archive_project(store: Store, project_id: str, destination: Path) -> dict:
-    bundle = store.export_project(project_id)
-    bundle["extensions"] = collect_extensions(store, project_id)
+    init_extensions(store)
+    with store.connection() as conn:
+        conn.execute("BEGIN")
+        try:
+            bundle = store.export_project(project_id, conn)
+            bundle["extensions"] = collect_extensions(store, project_id, conn)
+        finally:
+            conn.rollback()
     destination = Path(destination)
     require(not destination.exists() and not destination.is_symlink(), "archive_conflict", 409, "归档已存在")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -126,9 +133,17 @@ def restore_archive(store: Store, source: Path) -> dict:
         expected = {f"assets/{a['sha256']}" for a in assets if isinstance(a, dict) and isinstance(a.get("sha256"), str)}
         require(names == expected | {"metadata.json"}, "invalid_archive", 400, "归档成员与资产清单不匹配")
         # Validate the complete metadata graph without touching the destination DB.
-        with tempfile.TemporaryDirectory(prefix=".archive-validate-") as trial:
+        with tempfile.TemporaryDirectory(prefix=".archive-validate-", dir=store.db_path.parent) as trial:
             verified_store = Store(Path(trial) / "verify.sqlite", Path(trial))
             verified_store.restore_project(bundle)
+            _verify_binaries(archive, assets)
+            trial_assets = Path(trial) / "assets"
+            trial_assets.mkdir()
+            for sha in sorted({asset["sha256"] for asset in assets}):
+                with archive.open(f"assets/{sha}") as source_binary, (trial_assets / sha).open("xb") as target_binary:
+                    shutil.copyfileobj(source_binary, target_binary, 1024 * 1024)
+            with verified_store.transaction() as conn:
+                conn.execute("UPDATE assets SET storage_key=sha256")
             extension = bundle.get("extensions")
             if extension is None:
                 init_extensions(verified_store)
@@ -137,7 +152,6 @@ def restore_archive(store: Store, source: Path) -> dict:
                 extension_rows = validate_extensions(verified_store, extension, bundle["project"]["id"])
             with verified_store.connection() as source_conn:
                 validated_rows = {table: [dict(row) for row in source_conn.execute(f"SELECT * FROM {table}")] for table in TABLES}
-        _verify_binaries(archive, assets)
         # All IDs and existing content-addressed blobs are checked before any write.
         with store.connection() as conn:
             for table, ids in (("projects", [bundle["project"]["id"]]), ("episodes", [x["id"] for x in bundle["episodes"]]), ("scenes", [x["id"] for x in bundle["scenes"]]), ("assets", [x["id"] for x in assets]), ("shots", [x["id"] for x in bundle["shots"]])):

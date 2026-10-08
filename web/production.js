@@ -1,6 +1,6 @@
 import {api, asciiJsonHeader, byId, escapeHtml, option, field, area} from './api.js';
 import {heading, section, empty} from './views.js';
-import {splitShotNotes, mergeShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from './state.js';
+import {splitShotNotes, mergeShotNotes, readEpisodeExpectation, mergeEpisodeExpectation, readSceneTime, mergeSceneTime, isStructuredNoteLine, buildTimelineItem, buildCue, formatTime, filterJobs, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from './state.js';
 
 const jobKinds = {h3:'视频生成',text:'文本建议',probe:'媒体核验',asr:'离线语音识别',export:'成片导出'};
 const jobStates = {queued:'待执行',submitting:'提交中',running:'运行中',needs_reconcile:'待核对',succeeded:'技术完成',failed:'失败',cancelled:'已取消'};
@@ -10,14 +10,15 @@ export function renderDirector(ctx) {
   const selectedScene = ctx.scenes.find(scene => scene.id === ctx.sceneId);
   const notes = shot ? splitShotNotes(ctx.episode.creative_notes, shot.id) : {motivation:'', choice:''};
   const body = heading('编导工作台', '剧本、场景目标与人物选择由你决定。') + `<div class="split"><div class="stack">` +
-    section('分集剧本', `<div class="stack form-panel">${field('分集名称','episode-title',ctx.episode.title)}${area('剧本文本','episode-script',ctx.episode.script)}${area('其他创作备注','episode-notes',ctx.episode.creative_notes.split(/\r?\n/).filter(line => !/^\s*(动机|选择)\[[^\]]+\]\s*[:：]/.test(line)).join('\n'))}<div class="actions"><button id="save-script" class="primary">保存剧本</button></div></div>`) +
-    section('场景', `<div class="stack">${ctx.scenes.length ? ctx.scenes.map(scene => `<div><b>${escapeHtml(scene.title)}</b><p class="muted">目标：${escapeHtml(scene.purpose || '待填写')} · 地点：${escapeHtml(scene.location || '待填写')}</p></div>`).join('') : '<p class="muted">尚未建立场景。</p>'}<label class="field">选择要编辑的场景<select id="scene-select"><option value="">新建场景</option>${ctx.scenes.map(scene => option(scene.id,scene.title,scene.id===selectedScene?.id)).join('')}</select></label><div class="field-grid">${field('场景名','scene-title',selectedScene?.title || '')}${field('场景地点','scene-location',selectedScene?.location || '')}${area('这场的目标','scene-purpose',selectedScene?.purpose || '')}</div><button id="save-scene" class="primary">${selectedScene ? '保存场景修改' : '新增场景'}</button></div>`) + `</div><div class="stack">` +
+    section('分集剧本', `<div class="stack form-panel">${field('分集名称','episode-title',ctx.episode.title)}${area('剧本文本','episode-script',ctx.episode.script)}${area('下一集希望观众期待什么','episode-expectation',readEpisodeExpectation(ctx.episode.creative_notes))}${area('其他创作备注','episode-notes',ctx.episode.creative_notes.split(/\r?\n/).filter(line => !isStructuredNoteLine(line)).join('\n'))}<div class="actions"><button id="save-script" class="primary">保存剧本</button></div></div>`) +
+    section('场景', `<div class="stack">${ctx.scenes.length ? ctx.scenes.map(scene => `<div><b>${escapeHtml(scene.title)}</b><p class="muted">目标：${escapeHtml(scene.purpose || '待填写')} · 地点：${escapeHtml(scene.location || '待填写')} · 时间：${escapeHtml(readSceneTime(ctx.episode.creative_notes,scene.id) || '待填写')}</p></div>`).join('') : '<p class="muted">尚未建立场景。</p>'}<label class="field">选择要编辑的场景<select id="scene-select"><option value="">新建场景</option>${ctx.scenes.map(scene => option(scene.id,scene.title,scene.id===selectedScene?.id)).join('')}</select></label><div class="field-grid">${field('场景名','scene-title',selectedScene?.title || '')}${field('场景地点','scene-location',selectedScene?.location || '')}${field('场景时间（如夜、清晨）','scene-time',selectedScene ? readSceneTime(ctx.episode.creative_notes,selectedScene.id) : '')}${area('这场的目标','scene-purpose',selectedScene?.purpose || '')}</div><button id="save-scene" class="primary">${selectedScene ? '保存场景修改' : '新增场景'}</button></div>`) + `</div><div class="stack">` +
     section('人物动机与选择', shot ? `<div class="stack"><label class="field">镜头<select id="director-shot">${ctx.shots.map((item, i) => option(item.id, `${i + 1}. ${item.story_job || '未命名'}`, item.id === shot.id)).join('')}</select></label>${area('这一镜人物为什么行动','motivation',notes.motivation)}${area('人物作出了什么选择','choice',notes.choice)}<button id="save-choices" class="primary">保存人物动机与选择</button><p class="hint">这是结构化创作记录；机器只能检查是否填写，不能判断故事是否精彩。</p></div>` : empty('先建立镜头', '在分镜工作台新增镜头后，可记录每一镜的人物选择。')) + `</div></div>`;
   ctx.el.innerHTML = body;
   byId('save-script').onclick = () => ctx.run(async () => {
     const other = byId('episode-notes').value;
-    const shotLines = ctx.episode.creative_notes.split(/\r?\n/).filter(line => /^\s*(动机|选择)\[[^\]]+\]\s*[:：]/.test(line));
-    await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:ctx.episode.revision, title:byId('episode-title').value, script:byId('episode-script').value, creative_notes:[other, ...shotLines].filter(Boolean).join('\n')}});
+    const structured = ctx.episode.creative_notes.split(/\r?\n/).filter(line => isStructuredNoteLine(line) && !/^\s*续集期待\s*[:：]/.test(line));
+    const merged = mergeEpisodeExpectation([other, ...structured].filter(Boolean).join('\n'), byId('episode-expectation').value);
+    await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:ctx.episode.revision, title:byId('episode-title').value, script:byId('episode-script').value, creative_notes:merged}});
     await ctx.reload(); ctx.notify('剧本已保存');
   });
   byId('scene-select').onchange = event => {
@@ -25,6 +26,7 @@ export function renderDirector(ctx) {
     const chosen = ctx.scenes.find(scene => scene.id === ctx.sceneId);
     byId('scene-title').value = chosen?.title || '';
     byId('scene-location').value = chosen?.location || '';
+    byId('scene-time').value = chosen ? readSceneTime(ctx.episode.creative_notes, chosen.id) : '';
     byId('scene-purpose').value = chosen?.purpose || '';
     byId('save-scene').textContent = chosen ? '保存场景修改' : '新增场景';
   };
@@ -32,10 +34,12 @@ export function renderDirector(ctx) {
     const sceneId = byId('scene-select').value;
     const payload = {title:byId('scene-title').value || '未命名场景', location:byId('scene-location').value, purpose:byId('scene-purpose').value};
     if (sceneId) {
-      await api(`/api/episodes/${ctx.episode.id}/scenes/${sceneId}`, {method:'PUT', body:{revision:ctx.episode.revision,...payload}});
+      const changed = await api(`/api/episodes/${ctx.episode.id}/scenes/${sceneId}`, {method:'PUT', body:{revision:ctx.episode.revision,...payload}});
+      await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:changed.episode_revision, creative_notes:mergeSceneTime(ctx.episode.creative_notes, sceneId, byId('scene-time').value)}});
     } else {
       const created = await api(`/api/episodes/${ctx.episode.id}/scenes`, {method:'POST', body:{...payload,sequence:ctx.scenes.length}});
       ctx.sceneId = created.id;
+      await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:ctx.episode.revision, creative_notes:mergeSceneTime(ctx.episode.creative_notes, created.id, byId('scene-time').value)}});
     }
     await ctx.reload(); ctx.notify(sceneId ? '场景目标已保存' : '场景已建立');
   });
@@ -74,6 +78,10 @@ export function renderJobs(ctx) {
     `<div class="split"><section class="section"><div class="tabs">${[['all','全部'],['pending','待执行'],['running','运行中'],['review','待校核'],['failed','失败']].map(([value,label])=>`<button data-filter="${value}" class="${(ctx.jobFilter || 'all') === value ? 'active' : ''}">${label}</button>`).join('')}</div>${visible.length ? `<div class="table-wrap"><table><thead><tr><th>镜头</th><th>任务类型</th><th>状态</th><th>当前阶段</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty(jobs.length ? '此筛选暂无任务' : '暂无任务', jobs.length ? '换一个状态查看，或等待任务实际推进。' : '先在分镜中确认镜头、参考素材与生成参数。', jobs.length ? '' : '<button id="go-shots" class="primary">打开分镜</button>')}</section><div class="stack">` +
     section('执行规则', '<ul><li>单 GPU 任务独占；不接管其他服务的队列。</li><li>CPU 核验与后期最多并行两项。</li><li>失败保留原素材和中间结果。</li><li>不确定的外部提交需核对，不能盲目重试。</li></ul>') +
     section('任务详情', active ? `<div class="stack"><b>${escapeHtml(jobKinds[active.kind] || active.kind)} · ${escapeHtml(jobStates[active.state] || active.state)}</b><small>任务建立：${escapeHtml(active.created_at)}</small>${active.failure_message ? `<p class="error">${escapeHtml(active.failure_message)}</p>` : ''}${active.state === 'succeeded' ? '<p class="hint">技术任务已完成。视频仍需明确选片和人工审看。</p>' : ''}${active.kind === 'text' && active.result?.suggestion ? `<div class="note-box">待采纳文本建议：${escapeHtml(active.result.suggestion)}</div><button id="adopt-text">确认采纳到镜头任务</button>` : ''}${ctx.reconcileReport && active.id === ctx.reconcileJobId ? `<p class="note-box">${escapeHtml(ctx.reconcileReport.message)}${ctx.reconcileReport.external_state ? ` · 外部状态 ${escapeHtml(ctx.reconcileReport.external_state)}` : ''}</p>` : ''}<div class="actions">${active.state === 'queued' ? `<button id="cancel-job">取消排队</button>` : ''}${active.state === 'failed' ? `<label class="field">新方案版本<input id="retry-version" type="number" min="1" value="${Number(active.payload.plan_revision || 0) + 1}"></label><label class="field">调整说明<input id="retry-strategy" placeholder="说明输入或策略的变化"></label><button id="retry-job">改变方案后重试</button>` : ''}${active.state === 'needs_reconcile' ? `<button id="reconcile-job">只读核对外部状态</button>` : ''}${active.state === 'needs_reconcile' && active.id === ctx.reconcileJobId && ['succeeded','failed'].includes(ctx.reconcileReport?.external_state) && ctx.reconcileReport?.started_at && ctx.reconcileReport?.finished_at ? '<button id="resolve-job">按外部证据收束本地任务</button>' : ''}</div>${active.state === 'needs_reconcile' && active.id === ctx.reconcileJobId && ['succeeded','failed'].includes(ctx.reconcileReport?.external_state) && ctx.reconcileReport?.started_at && ctx.reconcileReport?.finished_at ? '<p class="hint">会收集外部候选并更新本地任务；不会向外部重新提交或中断任务。</p>' : ''}<details><summary>阶段记录</summary>${active.phases.map(phase => `<p class="hint">${escapeHtml(phase.phase)} · ${escapeHtml(phase.entered_at)}${phase.duration_ms != null ? ` · ${phase.duration_ms} ms` : ''}</p>`).join('')}</details></div>` : empty('尚未选择任务', '任务出现后可查看阶段与错误。')) + `</div></div>`;
+  if (active?.kind === 'text' && active.state === 'needs_reconcile') {
+    byId('reconcile-job').textContent = '查看人工核对说明';
+    byId('reconcile-job').insertAdjacentHTML('afterend', `<label class="field">本地收束说明<textarea id="manual-settlement-note" placeholder="记录你已检查的本地情况；外部结果仍可能未知"></textarea></label><label class="field"><input id="manual-settlement-ack" type="checkbox">我确认仅结束本地等待，未核验外部请求结束，也不会取消或自动重投</label><button id="manual-settle-job">人工确认本地失败收束</button>`);
+  }
   const events = jobs.flatMap(job => job.phases.map(phase => ({job, phase}))).sort((a,b)=>b.phase.entered_at.localeCompare(a.phase.entered_at)).slice(0,5);
   ctx.el.insertAdjacentHTML('beforeend', `<div style="margin-top:16px">${section('最近事件', events.length ? events.map(({job,phase})=>`<p class="hint">${escapeHtml(phase.entered_at.slice(0,19).replace('T',' '))} · ${escapeHtml(jobKinds[job.kind] || job.kind)} · ${escapeHtml(phase.phase)}</p>`).join('') : empty('尚未开始运行任务','这里会显示真实阶段记录。'))}</div>`);
   document.querySelectorAll('[data-job]').forEach(button => button.onclick = () => {ctx.jobId = button.dataset.job; ctx.render();});
@@ -107,19 +115,38 @@ export function renderJobs(ctx) {
     ctx.reconcileReport=null;
     await ctx.reload();ctx.notify('已按外部执行证据更新本地任务；成功候选仍须明确选片和人工审看');
   });
+  if (active && byId('manual-settle-job')) byId('manual-settle-job').onclick = () => ctx.run(async () => {
+    if (!byId('manual-settlement-ack').checked || !byId('manual-settlement-note').value.trim()) throw new Error('请确认未知外部状态并填写本地收束说明');
+    await api(`/api/projects/${ctx.project.id}/jobs/${active.id}/manual-settlement`, {method:'POST', body:{acknowledged:true,note:byId('manual-settlement-note').value.trim()}});
+    ctx.reconcileReport=null;
+    await ctx.reload(); ctx.notify('已由你确认本地失败收束；外部结果未核验，未取消或自动重投');
+  });
 }
 
 export function renderReview(ctx) {
   const {shot, item} = selectReviewContext(ctx.shots, ctx.timeline?.items, ctx.reviewShotId || ctx.shotId);
   const speaker = shot?.dialogue?.[0]?.speaker_id || '';
   const audioAssets = ctx.assets.filter(asset => asset.kind === 'audio' && asset.binary_available);
-  const asrResult = ctx.jobs.filter(job => job.kind === 'asr' && job.shot_id === shot?.id && job.state === 'succeeded' && Array.isArray(job.result?.segments)).at(-1);
+  const asrResult = ctx.jobs.filter(job => job.kind === 'asr' && job.shot_id === shot?.id && job.state === 'succeeded' && Array.isArray(job.result?.segments) && job.result?.shot_revision === shot.revision && (job.result?.source !== 'selected_video' || job.result.source_asset_id === shot.selected_candidate_id)).at(-1);
   const cueRows = (ctx.cues?.cues || []).map((cue, index) => cueRow(cue, index, ctx)).join('');
   ctx.el.innerHTML = heading('声音与校核', '机器检查与人工审看分别记录。', shot ? `<label class="field">当前镜头<select id="review-shot">${ctx.shots.map((candidate,index)=>option(candidate.id,`${index+1}. ${candidate.story_job || '未命名镜头'}`,candidate.id===shot.id)).join('')}</select></label>` : '') + `<div class="stack">` +
     section('选片人工校核', shot?.selected_candidate_id ? `<div class="stack form-panel"><label class="field">结论<select id="review-verdict"><option value="pass">人工通过</option><option value="revise">需要修改</option><option value="reject">拒绝使用</option></select></label>${area('审看记录','review-note')}<button id="save-review" class="primary">保存人工校核</button><div>${ctx.qc.filter(row=>row.shot_id===shot.id).map(row => `<p class="hint">${escapeHtml(shot.story_job || '镜头')} · ${escapeHtml(row.verdict)} · ${row.current ? '当前版本' : '已过期'} · ${escapeHtml(row.note)}</p>`).join('')}</div></div>` : empty('当前镜头还没有选片', '在分镜中导入并明确选择视频后，再记录人工校核。')) +
     section('字幕与原生对白', ctx.timeline?.status === 'ready' ? `<div class="stack"><p class="hint">字幕时间以整集输出起点为零；来源必须属于覆盖的实际片段。当前状态：${escapeHtml(ctx.cues?.status || 'needs_entry')}</p><div id="cue-rows">${cueRows}</div><div class="actions"><button id="add-cue">新增字幕</button><button id="save-cues" class="primary">保存字幕</button>${ctx.cues?.status === 'ready' && ctx.cues?.cues?.length ? `<a href="/api/episodes/${ctx.episode.id}/cues/srt" download="captions.srt">下载 SRT</a>` : ''}</div></div>` : empty('字幕等待实际时间轴', '请先明确选片，并在导出工作区保存实际切点。')) +
     section('原文与实录比较', shot ? `<div class="stack form-panel"><p class="hint">原文取当前镜头的原生对白。实录每行一句，可写“说话人：内容”；机器仅标差异线索，不能代替听审。</p><p>原文：${escapeHtml(shot.dialogue.map(line=>`${line.speaker_id}：${line.text}`).join(' / ') || '当前镜头未填写对白')}</p>${area('人工记录的实录','actual-transcript')}${ctx.settings.asr === 'configured' && audioAssets.length ? `<label class="field">离线识别的声音素材<select id="asr-audio">${audioAssets.map(asset=>option(asset.id,asset.rights?.source || '声音素材')).join('')}</select></label>` : '<span class="hint">离线语音识别未配置或无可用声音素材</span>'}<div class="actions"><button id="compare-transcript">比较文本差异</button>${ctx.settings.asr === 'configured' && audioAssets.length ? `<button id="queue-asr">排队离线语音识别</button>` : ''}${asrResult ? '<button id="load-asr">载入机器识别文本</button>' : ''}</div><div id="transcript-flags" class="hint">${ctx.transcriptReport ? ctx.transcriptReport.findings.map(f=>escapeHtml(f.detail)).join('；') || '没有文本差异线索，仍需人工听审' : ''}</div></div>` : empty('尚无镜头对白', '请先在分镜中记录原生对白。')) +
     section('结构性故事提示', `<p class="hint">仅检查显式填写项，不判断表演、情绪或观众反应。</p>${ctx.story.length ? `<ul>${ctx.story.map(finding=>`<li>${escapeHtml(finding.suggestion)}</li>`).join('')}</ul>` : '<p>当前没有结构性缺项提示。</p>'}`) + `</div>`;
+  const selectedVideo = ctx.assets.find(asset => asset.id === shot?.selected_candidate_id && asset.kind === 'video' && asset.binary_available);
+  if (shot && selectedVideo && ctx.settings.asr === 'configured') {
+    const videoOption = `<option value="${escapeHtml(selectedVideo.id)}" data-source="selected_video">当前镜头选片的音轨 · ${escapeHtml(selectedVideo.rights?.source || '视频')}</option>`;
+    if (byId('asr-audio')) {
+      byId('asr-audio').insertAdjacentHTML('afterbegin', videoOption);
+      byId('asr-audio').closest('label').firstChild.textContent = '离线识别来源';
+    }
+    else {
+      const actions = byId('actual-transcript').closest('.form-panel').querySelector('.actions');
+      actions.insertAdjacentHTML('beforebegin', `<label class="field">离线识别来源<select id="asr-audio">${videoOption}</select></label>`);
+      actions.insertAdjacentHTML('beforeend', '<button id="queue-asr">排队离线语音识别</button>');
+    }
+  }
   if (byId('review-shot')) byId('review-shot').onchange = event => {
     ctx.reviewShotId = event.target.value;
     ctx.transcriptReport = null;
@@ -136,7 +163,8 @@ export function renderReview(ctx) {
   });
   if (shot && byId('queue-asr')) byId('queue-asr').onclick = () => ctx.run(async () => {
     const audioId = byId('asr-audio').value;
-    await api(`/api/episodes/${ctx.episode.id}/shots/${shot.id}/jobs`,{method:'POST',body:{kind:'asr',payload:{asset_id:audioId,plan_revision:1,strategy:'offline-cpu'}}});
+    const source = byId('asr-audio').selectedOptions[0]?.dataset.source || 'audio_asset';
+    await api(`/api/episodes/${ctx.episode.id}/shots/${shot.id}/jobs`,{method:'POST',body:{kind:'asr',payload:{asset_id:audioId,source,plan_revision:1,strategy:'offline-cpu'}}});
     await ctx.reload();ctx.notify('离线语音识别任务已排队，结果需人工对照');
   });
   if (asrResult && byId('load-asr')) byId('load-asr').onclick = () => {

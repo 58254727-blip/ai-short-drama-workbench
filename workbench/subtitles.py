@@ -1,6 +1,5 @@
 """Human editable subtitle cues aligned to persisted selected source cuts."""
 
-import html
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +16,9 @@ def _now():
 
 def _init(conn):
     _timeline_init(conn)
-    conn.execute("CREATE TABLE IF NOT EXISTS subtitle_sets (episode_id TEXT PRIMARY KEY REFERENCES episodes(id), timeline_version INTEGER NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS subtitle_sets (episode_id TEXT PRIMARY KEY REFERENCES episodes(id), timeline_version INTEGER NOT NULL, shot_snapshot TEXT)")
+    if "shot_snapshot" not in {row["name"] for row in conn.execute("PRAGMA table_info(subtitle_sets)")}:
+        conn.execute("ALTER TABLE subtitle_sets ADD COLUMN shot_snapshot TEXT")
     conn.execute("CREATE TABLE IF NOT EXISTS subtitle_cues (id TEXT PRIMARY KEY, episode_id TEXT NOT NULL REFERENCES episodes(id), ordinal INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, text TEXT NOT NULL, speaker_id TEXT NOT NULL, source_asset_id TEXT NOT NULL REFERENCES assets(id))")
 
 
@@ -33,6 +34,17 @@ def _segments(items):
         offset = end
 
 
+def _shot_snapshot(conn, items):
+    return {item["shot_id"]: conn.execute("SELECT revision FROM shots WHERE id=?", (item["shot_id"],)).fetchone()["revision"] for item in items}
+
+
+def _valid_srt_text(value):
+    require(isinstance(value, str) and bool(value.strip()) and not any(character in value for character in "<>\r\x00")
+            and not any(ord(character) < 32 and character != "\n" for character in value),
+            "invalid_cue", 400, "字幕不支持标记或控制字符；请直接填写文字")
+    return value
+
+
 class SubtitleService:
     def __init__(self, store):
         self.store = store
@@ -43,7 +55,7 @@ class SubtitleService:
     def get_cues(self, episode_id: str) -> dict:
         with self.store.connection() as conn:
             episode = self.store._row(conn, "episodes", episode_id)
-            saved = conn.execute("SELECT timeline_version FROM subtitle_sets WHERE episode_id=?", (episode_id,)).fetchone()
+            saved = conn.execute("SELECT timeline_version,shot_snapshot FROM subtitle_sets WHERE episode_id=?", (episode_id,)).fetchone()
             timeline = conn.execute("SELECT version FROM episode_timelines WHERE episode_id=?", (episode_id,)).fetchone()
             items = _items(conn, episode_id)
             selected = True
@@ -59,7 +71,9 @@ class SubtitleService:
                 if not valid_binary:
                     selected = False
                     break
-            status = "needs_entry" if saved is None else "ready" if timeline and saved["timeline_version"] == timeline["version"] and selected else "needs_realign"
+            current_shots = _shot_snapshot(conn, items)
+            matched_shots = saved is not None and saved["shot_snapshot"] is not None and json.loads(saved["shot_snapshot"]) == current_shots
+            status = "needs_entry" if saved is None else "ready" if timeline and saved["timeline_version"] == timeline["version"] and selected and matched_shots else "needs_realign"
             return {"episode_id": episode_id, "revision": episode["revision"], "status": status, "human_reviewed": False, "cues": _cues(conn, episode_id)}
 
     def save_cues(self, episode_id: str, cues: list[dict], revision: int) -> dict:
@@ -87,7 +101,7 @@ class SubtitleService:
                 require(start >= previous_end, "cue_overlap", 400, "字幕重叠或顺序错误")
                 previous_end = end
                 require(end <= segments[-1][1], "cue_out_of_range", 400, "字幕超出整集实际片段时长")
-                require(isinstance(cue["text"], str) and bool(cue["text"].strip()), "invalid_cue", 400, "字幕文本不能为空")
+                _valid_srt_text(cue["text"])
                 covering = next((position for position, (left, right, asset) in enumerate(segments) if left <= start and end <= right and cue["source_asset_id"] == asset), None)
                 require(covering is not None, "cue_source_mismatch", 409, "字幕来源与覆盖片段不匹配")
                 require(cue["speaker_id"] in speakers_by_shot.get(items[covering]["shot_id"], set()), "unknown_speaker", 400, "字幕说话人未见于当前片段镜头对白")
@@ -98,7 +112,8 @@ class SubtitleService:
             conn.execute("DELETE FROM subtitle_cues WHERE episode_id=?", (episode_id,))
             for row in checked:
                 conn.execute("INSERT INTO subtitle_cues VALUES (?,?,?,?,?,?,?,?)", row)
-            conn.execute("INSERT INTO subtitle_sets VALUES (?,?) ON CONFLICT(episode_id) DO UPDATE SET timeline_version=excluded.timeline_version", (episode_id, timeline["version"]))
+            snapshot = json.dumps(_shot_snapshot(conn, items), sort_keys=True)
+            conn.execute("INSERT INTO subtitle_sets (episode_id,timeline_version,shot_snapshot) VALUES (?,?,?) ON CONFLICT(episode_id) DO UPDATE SET timeline_version=excluded.timeline_version,shot_snapshot=excluded.shot_snapshot", (episode_id, timeline["version"], snapshot))
             conn.execute("UPDATE episodes SET revision=revision+1,updated_at=? WHERE id=?", (_now(), episode_id))
         return self.get_cues(episode_id)
 
@@ -115,6 +130,5 @@ def write_srt(cues: list[dict], path: Path) -> None:
     for index, cue in enumerate(cues, 1):
         start, end = cue["start_ms"], cue["end_ms"]
         require(type(start) is int and type(end) is int and 0 <= start < end, "invalid_cue", 400, "字幕时间无效")
-        require(isinstance(cue["text"], str), "invalid_cue", 400, "字幕文本无效")
-        lines.append(f"{index}\n{_stamp(start)} --> {_stamp(end)}\n{html.escape(cue['text'], quote=False)}\n")
+        lines.append(f"{index}\n{_stamp(start)} --> {_stamp(end)}\n{_valid_srt_text(cue['text'])}\n")
     Path(path).write_text("\n".join(lines), encoding="utf-8")

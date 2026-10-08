@@ -52,7 +52,7 @@ def _fields(body, allowed, required=()):
 
 def _public_job(job):
     visible = {key: value for key, value in job.items() if key not in {"claim_token", "lease_until", "source_snapshot"}}
-    visible["payload"] = {key: value for key, value in job["payload"].items() if key in {"asset_id", "first_frame_asset_id", "plan_revision", "strategy", "subtitles", "width", "height", "fps"}}
+    visible["payload"] = {key: value for key, value in job["payload"].items() if key in {"asset_id", "source", "first_frame_asset_id", "plan_revision", "strategy", "subtitles", "width", "height", "fps"}}
     return visible
 
 
@@ -90,7 +90,7 @@ class App:
     def _recover_expired_locked(self):
         recovered = self.queue.recover()
         for job in recovered:
-            if job["resource"] == "gpu" and job["state"] == "needs_reconcile":
+            if job["state"] == "needs_reconcile" and (job["resource"] == "gpu" or job["kind"] == "text"):
                 self.reconcile_tokens[job["id"]] = job["claim_token"]
         return recovered
 
@@ -217,19 +217,16 @@ class App:
         require(body["verdict"] in ("pass", "revise", "reject") and isinstance(body["note"], str), "invalid_payload", 400, "人工校核状态无效")
         return self.review.save(episode_id, shot_id, asset["id"], body["verdict"], body["note"])
 
-    def _export(self, project_id, episode_id, body, export_id=None):
+    def _export(self, project_id, episode_id, body, export_id, job):
         _fields(body, {"subtitles", "width", "height", "fps"}, {"subtitles"})
         self._scope(project_id, episode_id)
-        timeline = self.timeline.get_timeline(episode_id)
-        require(timeline["status"] == "ready", "timeline_missing", 409, "请先保存实际已选时间轴")
-        captions = self.subtitles.get_cues(episode_id)
+        source = self.queue.assert_export_source(job)
+        fingerprint = hashlib.sha256(json.dumps(job["source_snapshot"], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         include = body["subtitles"]
         require(type(include) is bool, "invalid_payload", 400, "字幕选择无效")
-        if include:
-            require(captions["status"] == "ready" and bool(captions["cues"]), "captions_not_ready", 409, "字幕未就绪")
         output_dir = self.root / "exports"
         output_dir.mkdir(exist_ok=True)
-        export_id = _id(export_id) if export_id else str(uuid4())
+        export_id = _id(export_id)
         output = output_dir / f"{export_id}.mp4"
         srt = output_dir / f"{export_id}.srt" if include else None
         report_path = output_dir / f"{export_id}.json"
@@ -241,20 +238,26 @@ class App:
                     digest = hashlib.file_digest(stream, "sha256").hexdigest()
             except (OSError, ValueError, UnicodeError):
                 raise DomainError("export_incomplete", 409, "上次导出记录不可核对") from None
-            require(prior.get("project_id") == project_id and prior.get("episode_id") == episode_id and prior.get("sha256") == digest and prior.get("subtitle_included") is include,
+            require(prior.get("project_id") == project_id and prior.get("episode_id") == episode_id and prior.get("sha256") == digest and prior.get("subtitle_included") is include and prior.get("source_fingerprint") == fingerprint,
                     "export_incomplete", 409, "上次导出与当前请求不一致")
             require(not include or srt.is_file(), "export_incomplete", 409, "上次导出字幕缺失")
             return prior
         try:
             if srt:
-                write_srt(captions["cues"], srt)
+                write_srt(source["cues"], srt)
             result = export_episode({"store": self.store, "project_id": project_id, "episode_id": episode_id, "output_path": output,
-                                     "width": body.get("width", 1280), "height": body.get("height", 720), "fps": body.get("fps", 24)}, timeline["items"], srt)
+                                     "width": body.get("width", 1280), "height": body.get("height", 720), "fps": body.get("fps", 24)}, source["items"], srt)
             report = {k: v for k, v in result.items() if k != "path"}
+            shot_state = {shot["id"]: shot for shot in source["shots"]}
+            qc = [{**row, "current": bool(shot_state.get(row["shot_id"], {}).get("selected_candidate_id") == row["asset_id"]
+                   and shot_state[row["shot_id"]]["revision"] == row["shot_revision"] and source["timeline_version"] == row["timeline_version"])}
+                  for row in source["manual_qc"]]
             report.update({"id": export_id, "project_id": project_id, "episode_id": episode_id,
                            "video_url": f"/api/projects/{project_id}/exports/{export_id}.mp4", "srt_url": f"/api/projects/{project_id}/exports/{export_id}.srt" if srt else None,
-                           "missing_caption_flag": not include, "manual_qc": self._qc(episode_id)})
-            report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+                           "missing_caption_flag": not include, "manual_qc": qc, "source_fingerprint": fingerprint})
+            with self.store.transaction() as conn:
+                self.queue.assert_export_source(job, conn)
+                report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
             return report
         except Exception:
             output.unlink(missing_ok=True)
@@ -274,11 +277,22 @@ class App:
             require(self.status()["asr"] == "configured", "asr_unconfigured", 503, "离线语音模型未就绪")
             asset = self._asset(job["project_id"], job["payload"]["asset_id"])
             require(asset["binary_available"], "asset_binary_missing", 409, "声音素材缺失")
-            return {"segments": transcribe_offline(self.root / "assets" / asset["storage_key"], Path(config["config_path"])), "human_reviewed": False}
+            source = job["payload"].get("source", "audio_asset")
+            if source == "selected_video":
+                prior = job["source_snapshot"]["shot"]
+                current = self._shot(job["episode_id"], job["shot_id"])
+                require(prior["revision"] == current["revision"] and current["selected_candidate_id"] == asset["id"]
+                        and asset["kind"] == "video", "revision_conflict", 409, "识别来源选片或镜头已变化，请重新排队")
+                require(probe(self.root / "assets" / asset["storage_key"], data_root=self.root)["has_audio"],
+                        "audio_missing", 422, "当前选片没有音轨")
+            else:
+                require(source == "audio_asset" and asset["kind"] == "audio", "invalid_kind", 400, "识别来源无效")
+            return {"segments": transcribe_offline(self.root / "assets" / asset["storage_key"], Path(config["config_path"])),
+                    "source_asset_id": asset["id"], "source_sha256": asset["sha256"], "source": source,
+                    "shot_revision": job["source_revision"], "human_reviewed": False}
 
         def export_job(_, job):
-            require(self.store.get_episode(job["episode_id"])["revision"] == job["source_revision"], "revision_conflict", 409, "排队后分集已变化，请重新检查时间轴和字幕")
-            return self._export(job["project_id"], job["episode_id"], {key: value for key, value in job["payload"].items() if key in {"subtitles", "width", "height", "fps"}}, job["id"])
+            return self._export(job["project_id"], job["episode_id"], {key: value for key, value in job["payload"].items() if key in {"subtitles", "width", "height", "fps"}}, job["id"], job)
 
         def text_job(_, job):
             from .adapters.text import TextAdapter
@@ -351,6 +365,17 @@ class App:
                     done.set(); thread.join()
             self.reconcile_tokens.pop(current["id"], None)
             return self.queue.get_job(current["id"])
+
+    def settle_uncertain_text(self, job, acknowledged, note):
+        with self.reconcile_lock:
+            self._recover_expired_locked()
+            current = self.queue.get_job(job["id"])
+            token = self.reconcile_tokens.get(current["id"])
+            require(token is not None and token == current["claim_token"], "lease_active", 409,
+                    "原处理者租约仍有效；到期后才可人工收束")
+            result = self.queue.settle_uncertain_text(current["id"], token, acknowledged, note)
+            self.reconcile_tokens.pop(current["id"], None)
+            return result
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -476,6 +501,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(200, {key: value for key, value in probe(app.root / "assets" / asset["storage_key"], data_root=app.root).items() if key != "path"})
             if len(parts) == 5 and parts[2] == "assets" and parts[4] == "media" and method == "GET":
                 asset = app._asset(project_id, _id(parts[3]))
+                require(asset["binary_available"], "asset_binary_missing", 404, "素材文件缺失或哈希不符")
                 media = app.root / "assets" / asset["storage_key"]
                 require(media.is_file(), "asset_binary_missing", 404, "素材文件缺失")
                 with media.open("rb") as stream: signature = stream.read(16)
@@ -524,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._reply(201, _public_job(app.queue.retry(job["id"], {**job["payload"], **body})))
                 if parts[4:] == ["reconcile"] and method == "GET":
                     require(job["state"] == "needs_reconcile", "invalid_state", 409, "任务目前无需外部核对")
+                    if job["kind"] == "text":
+                        return self._reply(200, {"status": "manual_pending", "message": "文本请求结果未知。请在原服务人工核对；可确认仅结束本地等待，不代表外部请求已结束或成功。"})
                     if not job["external_id"]:
                         return self._reply(200, {"status": "manual_pending", "message": "外部任务 ID 未知；请在原服务人工核实，不能重投"})
                     require(app.status()["video"] == "configured", "video_unconfigured", 503, "原视频服务配置不可用，需人工核对")
@@ -538,6 +566,9 @@ class Handler(BaseHTTPRequestHandler):
                     from .adapters.comfy import ComfyAdapter
                     adapter = ComfyAdapter(app.config["video"]["endpoint"], 20)
                     return self._reply(200, _public_job(app.resolve_known(job, adapter)))
+                if parts[4:] == ["manual-settlement"] and method == "POST":
+                    _fields(body, {"acknowledged", "note"}, {"acknowledged", "note"})
+                    return self._reply(200, _public_job(app.settle_uncertain_text(job, body["acknowledged"], body["note"])))
                 if parts[4:] == ["adopt"] and method == "POST":
                     _fields(body, {"revision"}, {"revision"})
                     require(job["kind"] == "text" and job["state"] == "succeeded" and isinstance(job.get("result"), dict), "invalid_state", 409, "任务没有可采纳的文本建议")
@@ -644,10 +675,14 @@ class Handler(BaseHTTPRequestHandler):
                     if kind == "asr": require(app.status()["asr"] == "configured", "asr_unconfigured", 503, "离线语音识别未配置")
                     require(kind in ("h3", "text", "probe", "asr"), "invalid_kind", 400, "任务类型不支持")
                     if kind in ("probe", "asr"):
-                        _fields(payload, {"asset_id", "plan_revision", "strategy"}, {"asset_id"})
+                        _fields(payload, {"asset_id", "source", "plan_revision", "strategy"}, {"asset_id"})
                         asset = app._asset(episode["project_id"], _id(payload["asset_id"]))
                         if kind == "probe": require(asset["kind"] == "video", "invalid_kind", 400, "视频核验需要视频素材")
-                        if kind == "asr": require(asset["kind"] == "audio", "invalid_kind", 400, "离线语音识别需要声音素材")
+                        if kind == "asr":
+                            source = payload.get("source", "audio_asset")
+                            require((source == "audio_asset" and asset["kind"] == "audio") or
+                                    (source == "selected_video" and asset["kind"] == "video" and shot["selected_candidate_id"] == asset["id"]
+                                     and asset["binary_available"]), "invalid_kind", 400, "识别须选择可用声音或当前镜头选片音轨")
                     return self._reply(201, _public_job(app.queue.enqueue({"project_id": episode["project_id"], "episode_id": episode_id, "shot_id": shot["id"]}, kind, payload)))
             if parts[2:] == ["timeline"]:
                 if method == "GET": return self._reply(200, app.timeline.get_timeline(episode_id))

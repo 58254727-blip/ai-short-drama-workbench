@@ -109,10 +109,24 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual("needs_realign", result["status"])
         self.assertEqual(saved["cues"], result["cues"])
 
-    def test_srt_unicode_and_no_markup_injection(self):
+    def test_dialogue_edit_marks_saved_cues_stale_without_erasing_them(self):
+        saved = self.subtitles.save_cues(self.episode["id"], [self.cue()], self.saved_timeline["revision"])
+        self.store.save_shot(self.episode["id"], {"id": self.shot["id"], "dialogue": [{"speaker_id": "a", "text": "再见"}]}, self.shot["revision"])
+        result = self.subtitles.get_cues(self.episode["id"])
+        self.assertEqual(result["status"], "needs_realign")
+        self.assertEqual(result["cues"], saved["cues"])
+
+    def test_srt_preserves_literal_ampersand_quotes_and_unicode(self):
         path = self.root / "captions.srt"
-        write_srt([{**self.cue(), "text": "你好 <b>世界</b>"}], path)
-        self.assertEqual("1\n00:00:00,100 --> 00:00:00,500\n你好 &lt;b&gt;世界&lt;/b&gt;\n", path.read_text(encoding="utf-8-sig").strip() + "\n")
+        write_srt([{**self.cue(), "text": 'A&B，"你好"'}], path)
+        self.assertEqual('1\n00:00:00,100 --> 00:00:00,500\nA&B，"你好"\n', path.read_text(encoding="utf-8-sig").strip() + "\n")
+
+    def test_srt_rejects_markup_and_control_without_rewriting_words(self):
+        path = self.root / "captions.srt"
+        for value in ("你好 <b>世界</b>", "第一行\r第二行", "文字\x00结尾"):
+            with self.subTest(value=value), self.assertRaises(DomainError):
+                write_srt([{**self.cue(), "text": value}], path)
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

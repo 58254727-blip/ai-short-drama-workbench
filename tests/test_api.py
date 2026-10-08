@@ -15,6 +15,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from workbench.server import make_server
+from workbench.domain import DomainError
+from workbench import server as server_module
+from workbench.archive import archive_project, restore_archive
+from workbench.store import Store
 
 
 class ApiTests(unittest.TestCase):
@@ -44,6 +48,123 @@ class ApiTests(unittest.TestCase):
         with self.server.app.store.transaction() as conn:
             conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", ("2000-01-01T00:00:00+00:00", job_id))
         self.server.app.recover_expired()
+
+    def selected_export_fixture(self):
+        staging = Path(self.temp.name) / "staging"
+        staging.mkdir(exist_ok=True)
+        source = staging / "selected.mp4"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=160x90:r=10",
+                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "1",
+                        "-c:v", "mpeg4", "-c:a", "aac", str(source)], check=True, capture_output=True, timeout=30)
+        project = self.server.app.store.create_project("虚构")
+        episode = self.server.app.store.create_episode(project["id"], "一")
+        shot = self.server.app.store.save_shot(episode["id"], {"dialogue": [{"speaker_id": "甲", "text": "出发"}]})
+        asset = self.server.app.store.import_asset(project["id"], source, "video", {"source": "synthetic"})
+        shot = self.server.app.store.select_candidate(shot["id"], asset["id"], shot["revision"])
+        self.server.app.timeline.save_timeline(episode["id"], [{"shot_id": shot["id"], "source_asset_id": asset["id"], "in_ms": 0, "out_ms": 800}], episode["revision"])
+        return project, episode, shot, asset
+
+    def test_queued_export_rejects_shot_revision_change_before_work(self):
+        project, episode, shot, asset = self.selected_export_fixture()
+        status, queued = self.call("POST", f"/api/projects/{project['id']}/episodes/{episode['id']}/export-jobs", {"subtitles": False, "width": 160, "height": 90})
+        self.assertEqual(status, 201, queued)
+        self.server.app.store.save_shot(episode["id"], {"id": shot["id"], "dialogue": [{"speaker_id": "甲", "text": "停下"}]}, shot["revision"])
+        claimed = self.server.app.queue.claim("cpu")
+        with self.assertRaises(DomainError) as caught:
+            self.server.app._cpu_handlers()["export"](None, claimed)
+        self.assertEqual(caught.exception.code, "revision_conflict")
+        self.assertFalse((Path(self.temp.name) / "exports" / f"{queued['id']}.json").exists())
+
+    def test_queued_export_discards_output_if_source_changes_before_report(self):
+        project, episode, shot, asset = self.selected_export_fixture()
+        _, queued = self.call("POST", f"/api/projects/{project['id']}/episodes/{episode['id']}/export-jobs", {"subtitles": False, "width": 160, "height": 90})
+        claimed = self.server.app.queue.claim("cpu")
+        real_export = server_module.export_episode
+        def change_after_render(*args, **kwargs):
+            result = real_export(*args, **kwargs)
+            self.server.app.store.save_shot(episode["id"], {"id": shot["id"], "action": "改变"}, shot["revision"])
+            return result
+        with patch.object(server_module, "export_episode", side_effect=change_after_render):
+            with self.assertRaises(DomainError) as caught:
+                self.server.app._cpu_handlers()["export"](None, claimed)
+        self.assertEqual(caught.exception.code, "revision_conflict")
+        self.assertFalse((Path(self.temp.name) / "exports" / f"{queued['id']}.json").exists())
+        self.assertFalse((Path(self.temp.name) / "exports" / f"{queued['id']}.mp4").exists())
+
+    def test_queued_export_discards_output_if_binary_hash_changes_before_report(self):
+        project, episode, shot, asset = self.selected_export_fixture()
+        _, queued = self.call("POST", f"/api/projects/{project['id']}/episodes/{episode['id']}/export-jobs", {"subtitles": False, "width": 160, "height": 90})
+        claimed = self.server.app.queue.claim("cpu")
+        real_export = server_module.export_episode
+        def alter_source_after_render(*args, **kwargs):
+            result = real_export(*args, **kwargs)
+            (Path(self.temp.name) / "assets" / asset["sha256"]).write_bytes(b"modified after render")
+            return result
+        with patch.object(server_module, "export_episode", side_effect=alter_source_after_render):
+            with self.assertRaises(DomainError) as caught:
+                self.server.app._cpu_handlers()["export"](None, claimed)
+        self.assertEqual(caught.exception.code, "asset_hash_mismatch")
+        self.assertFalse((Path(self.temp.name) / "exports" / f"{queued['id']}.json").exists())
+        self.assertFalse((Path(self.temp.name) / "exports" / f"{queued['id']}.mp4").exists())
+
+    def test_changed_asset_hash_is_never_served_by_media_get(self):
+        project, episode, shot, asset = self.selected_export_fixture()
+        (Path(self.temp.name) / "assets" / asset["sha256"]).write_bytes(b"changed")
+        status, error = self.call("GET", f"/api/projects/{project['id']}/assets/{asset['id']}/media")
+        self.assertEqual(status, 404)
+        self.assertEqual(error["error"]["code"], "asset_binary_missing")
+
+    def test_cpu_text_manual_settlement_requires_local_recovered_claim(self):
+        project = self.server.app.store.create_project("虚构")
+        episode = self.server.app.store.create_episode(project["id"], "一")
+        shot = self.server.app.store.save_shot(episode["id"], {})
+        job = self.server.app.queue.enqueue({"project_id": project["id"], "episode_id": episode["id"], "shot_id": shot["id"]}, "text", {})
+        self.server.app.queue.claim("cpu")
+        route = f"/api/projects/{project['id']}/jobs/{job['id']}/manual-settlement"
+        self.assertEqual(self.call("POST", route, {"acknowledged": True, "note": "检查"})[0], 409)
+        self.expire_for_reconcile(job["id"])
+        self.assertEqual(self.call("POST", route, {"acknowledged": False, "note": "检查"})[0], 400)
+        status, settled = self.call("POST", route, {"acknowledged": True, "note": "用户确认外部状态未知"})
+        self.assertEqual(status, 200, settled)
+        self.assertEqual(settled["state"], "failed")
+        self.assertEqual(settled["manual_settlement"]["note"], "用户确认外部状态未知")
+        self.assertNotIn("claim_token", settled)
+
+    def test_selected_video_audio_can_feed_fenced_fake_asr(self):
+        project, episode, shot, asset = self.selected_export_fixture()
+        self.server.app.config["asr"] = {"config_path": "fake-local-config"}
+        route = f"/api/episodes/{episode['id']}/shots/{shot['id']}/jobs"
+        with patch.object(self.server.app, "status", return_value={"asr": "configured"}):
+            status, queued = self.call("POST", route, {"kind": "asr", "payload": {"source": "selected_video", "asset_id": asset["id"]}})
+        self.assertEqual(status, 201, queued)
+        job = self.server.app.queue.claim("cpu")
+        with patch.object(self.server.app, "status", return_value={"asr": "configured"}), patch.object(server_module, "transcribe_offline", return_value=[{"text": "机器线索", "speaker_id": "unknown", "status": "machine_clue"}]) as fake:
+            result = self.server.app._cpu_handlers()["asr"](None, job)
+        self.assertEqual(fake.call_args.args[0], Path(self.temp.name) / "assets" / asset["sha256"])
+        self.assertEqual(result["source_asset_id"], asset["id"])
+        self.assertFalse(result["human_reviewed"])
+        self.server.app.store.save_shot(episode["id"], {"id": shot["id"], "action": "修改"}, shot["revision"])
+        with patch.object(self.server.app, "status", return_value={"asr": "configured"}), patch.object(server_module, "transcribe_offline") as fake:
+            with self.assertRaises(DomainError):
+                self.server.app._cpu_handlers()["asr"](None, job)
+            fake.assert_not_called()
+
+    def test_story_notes_fields_are_recordable_and_restored(self):
+        project = self.server.app.store.create_project("虚构")
+        episode = self.server.app.store.create_episode(project["id"], "一")
+        first = self.server.app.store.create_scene(episode["id"], {"title": "前夜", "location": "屋内", "purpose": "等人", "sequence": 0})
+        second = self.server.app.store.create_scene(episode["id"], {"title": "清晨", "location": "屋内", "purpose": "出发", "sequence": 1})
+        notes = f"自由备注\n场景时间[{first['id']}]: 夜\n场景时间[{second['id']}]: 清晨\n续集期待: 门外是谁"
+        self.call("PUT", f"/api/episodes/{episode['id']}", {"revision": 1, "creative_notes": notes})
+        findings = self.call("GET", f"/api/episodes/{episode['id']}/story")[1]
+        self.assertFalse(any(item["field"] == "next_expectation" for item in findings))
+        self.assertTrue(any(item["field"] == "transition" and item["scene_id"] == second["id"] for item in findings))
+        saved = Path(self.temp.name) / "story-notes.zip"
+        archive_project(self.server.app.store, project["id"], saved)
+        restored_root = Path(self.temp.name) / "restored-notes"
+        restored = Store(restored_root / "db.sqlite", restored_root)
+        restore_archive(restored, saved)
+        self.assertEqual(restored.get_episode(episode["id"])["creative_notes"], notes)
 
     def test_manual_edits_persist_without_model_configuration(self):
         _, project = self.call("POST", "/api/projects", {"title": "虚构作品"})
@@ -240,10 +361,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(error["error"]["code"], "timeline_missing")
 
     def test_export_worker_rejects_edited_episode_after_queueing(self):
-        _, project = self.call("POST", "/api/projects", {"title":"甲"})
-        _, episode = self.call("POST", f"/api/projects/{project['id']}/episodes", {"title":"一"})
+        project, episode, shot, asset = self.selected_export_fixture()
         self.server.app.queue.enqueue({"project_id":project["id"],"episode_id":episode["id"]},"export",{"subtitles":False})
-        self.server.app.store.update_episode(episode["id"], {"script":"新版"}, 1)
+        self.server.app.store.update_episode(episode["id"], {"script":"新版"}, self.server.app.store.get_episode(episode["id"])["revision"])
         claimed = self.server.app.queue.claim("cpu")
         from workbench.domain import DomainError
         with self.assertRaises(DomainError) as stale:
