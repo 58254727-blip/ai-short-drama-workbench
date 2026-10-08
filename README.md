@@ -1,6 +1,12 @@
-# 镜序｜本地原创短剧工作台
+# 镜序｜AI 短剧制作工作台
+
+**Jingxu — Local AI Short-Drama Workbench**
 
 镜序是一个本地运行的短剧制作桌。可以手工建立作品、分集和镜头，导入有来源记录的素材，明确选片并设置剪辑切点，编辑字幕，使用 FFmpeg 导出 MP4／SRT／机器核验报告，并制作包含作品数据与素材二进制的完整 ZIP 备份。队列只有在操作者显式启动本地处理后才领取任务。
+
+Jingxu is a local-first workbench for AI short-drama production: scripts and storyboards, media asset management, shot selection, subtitle review, FFmpeg video export, and project backup. It runs locally with Python and a browser UI. Optional model adapters require separate configuration; model weights and credentials are not bundled.
+
+The H3, text-service, and ASR adapters have been tested with protocol fixtures, not live model services. Technical export checks do not constitute human review or finished-episode acceptance.
 
 界面与代码由本项目独立实现。示例“雨夜来客”是虚构演示，静帧不是生成视频。第三方工具、模型、字体及用户导入素材各自有独立许可；本项目不承诺所有 AI 输出自动具备版权或可商用。参见 [来源与依赖](docs/ORIGIN.md)。
 
