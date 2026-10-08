@@ -8,9 +8,13 @@ frontend/dist/
 .runtime/
 .env
 .env.*
-!.env.example
 config.local.json
 operator-config.json
+*.pem
+*.key
+*.ckpt
+*.onnx
+*.pth
 .workbench-data/
 *.sqlite*
 *.db

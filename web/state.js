@@ -78,6 +78,10 @@ export function timelineOffsetForShot(items, shotId) {
   return null;
 }
 
+export function refreshProjectSelection(current, projects) {
+  return projects.find(project => project.id === current?.id) || projects[0] || null;
+}
+
 export async function restoreArchiveFile(context, file, request) {
   if (!(file instanceof Blob) || file.size === 0) throw new Error('请先选择备份 ZIP');
   const restored = await request('/api/restore', {method:'POST', body:file});

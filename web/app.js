@@ -2,7 +2,7 @@ import {api, byId, escapeHtml, option} from './api.js';
 import {setView} from './views.js';
 import {renderShots} from './editor.js';
 import {renderDirector, renderAssets, renderJobs, renderReview, renderExport, renderSettings} from './production.js';
-import {restoreArchiveFile} from './state.js';
+import {restoreArchiveFile, refreshProjectSelection} from './state.js';
 
 const renderers = {director:renderDirector, shots:renderShots, assets:renderAssets, jobs:renderJobs, review:renderReview, export:renderExport, settings:renderSettings};
 const state = {
@@ -13,7 +13,7 @@ const state = {
   async run(action){if(this.busy)return; this.busy=true; this.notify('正在处理…'); try{await action();}catch(error){this.notify(error.message || '操作失败',true);}finally{this.busy=false;}},
   async reloadProjects(){
     this.projects=await api('/api/projects');
-    if(!this.projects.some(project=>project.id===this.project?.id)) this.project=this.projects[0]||null;
+    this.project=refreshProjectSelection(this.project,this.projects);
     await this.reload();
   },
   async reload(){

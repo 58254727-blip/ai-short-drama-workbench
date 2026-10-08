@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot, restoreArchiveFile} from '../web/state.js';
+import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot, restoreArchiveFile, refreshProjectSelection} from '../web/state.js';
 import {asciiJsonHeader} from '../web/api.js';
 
 test('per-shot motivation and choice preserve unrelated creative notes', () => {
@@ -116,4 +116,11 @@ test('project with no episode can switch directly to a restored project', async 
   }};
   await restoreArchiveFile(context,new Blob(['PK']),async () => ({project_id:'restored-project'}));
   assert.equal(context.episode.id, 'restored-first-episode');
+});
+
+test('restored zero-episode project reload uses its full persisted title', () => {
+  const projects = [{id:'older',title:'旧作品'},{id:'restored',title:'恢复作品'}];
+  assert.strictEqual(refreshProjectSelection({id:'restored'}, projects), projects[1]);
+  assert.strictEqual(refreshProjectSelection({id:'gone'}, projects), projects[0]);
+  assert.equal(refreshProjectSelection(null, []), null);
 });
