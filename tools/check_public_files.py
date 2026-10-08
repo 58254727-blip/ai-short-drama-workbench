@@ -28,13 +28,36 @@ SECRET_PATTERNS = (
 )
 
 
+def git_command(*args):
+    return subprocess.run(["git", "-c", f"safe.directory={ROOT.as_posix()}", *args],
+                          cwd=ROOT, capture_output=True, check=True).stdout
+
+
 def listed_files():
-    result = subprocess.run(["git", "-c", f"safe.directory={ROOT.as_posix()}", "ls-files", "--cached", "-z"],
-                            cwd=ROOT, capture_output=True, check=True)
-    return {name.decode("utf-8", "strict") for name in result.stdout.split(b"\0") if name}
+    result = git_command("ls-files", "--stage", "-z")
+    entries = {}
+    for record in result.split(b"\0"):
+        if not record:
+            continue
+        header, separator, name = record.partition(b"\t")
+        if not separator:
+            raise ValueError("invalid index record")
+        mode, oid, stage = header.decode("ascii").split(" ")
+        filename = name.decode("utf-8", "strict")
+        if filename in entries or stage != "0":
+            raise ValueError("unmerged or duplicate index path")
+        entries[filename] = (mode, oid)
+    return entries
 
 
-def check_path(name):
+def index_bytes(oid):
+    size = int(git_command("cat-file", "-s", oid))
+    if size > 8 * 1024 * 1024:
+        raise ValueError("index blob too large to inspect")
+    return git_command("cat-file", "blob", oid)
+
+
+def check_path(name, indexed=None):
     normalized = name.replace("\\", "/")
     path = PurePosixPath(normalized)
     if path.is_absolute() or ".." in path.parts or normalized.startswith("/") or ":" in normalized:
@@ -48,20 +71,35 @@ def check_path(name):
     suffix = path.suffix.lower()
     if suffix in FORBIDDEN_SUFFIXES or filename.endswith((".db-wal", ".db-shm")) or filename.startswith(".sqlite"):
         return "database, media, model, key, log, or archive"
-    target = ROOT / normalized
-    if target.is_symlink() or not target.is_file():
-        return "missing file or symlink"
+    if indexed is not None:
+        mode, oid = indexed
+        if mode not in {"100644", "100755"}:
+            return "index entry is not a regular file"
+        try:
+            data = index_bytes(oid)
+        except (ValueError, subprocess.CalledProcessError):
+            return "index blob unreadable or too large"
+    else:
+        target = ROOT / normalized
+        if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(ROOT):
+            return "missing file, symlink, or outside repository"
+        if target.stat().st_size > 8 * 1024 * 1024:
+            return "candidate too large to inspect"
+        try:
+            data = target.read_bytes()
+        except OSError:
+            return "candidate unreadable"
     if suffix == ".png":
         expected = APPROVED_IMAGES.get(normalized)
-        if not expected or hashlib.sha256(target.read_bytes()).hexdigest() != expected:
+        if not expected or hashlib.sha256(data).hexdigest() != expected:
             return "PNG lacks exact approved provenance/hash"
         return None
     if suffix not in TEXT_SUFFIXES and filename != ".gitignore":
         return "file type not approved"
-    if target.stat().st_size > 4 * 1024 * 1024:
+    if len(data) > 4 * 1024 * 1024:
         return "text file too large to inspect"
     try:
-        content = target.read_text(encoding="utf-8", errors="strict")
+        content = data.decode("utf-8", errors="strict")
     except UnicodeError:
         return "not UTF-8 text"
     if "\0" in content:
@@ -73,11 +111,12 @@ def check_path(name):
 
 def main():
     try:
-        names = listed_files() | set(sys.argv[1:])
-    except (OSError, subprocess.CalledProcessError, UnicodeError) as error:
+        indexed = listed_files()
+        names = set(indexed) | set(sys.argv[1:])
+    except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError) as error:
         print(f"Unable to read Git index: {type(error).__name__}", file=sys.stderr)
         return 2
-    failures = [(name, reason) for name in sorted(names) if (reason := check_path(name))]
+    failures = [(name, reason) for name in sorted(names) if (reason := check_path(name, indexed.get(name)))]
     for name, reason in failures:
         print(f"REJECT {name}: {reason}", file=sys.stderr)
     if failures:

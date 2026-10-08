@@ -33,6 +33,6 @@ node --test tests/frontend.test.mjs
 python tools/check_public_files.py
 ```
 
-发布校验器只检查 Git 已跟踪／暂存文件和命令行明确列出的候选文件，例如 `python tools/check_public_files.py path/to/new-file.py`。它拒绝数据库、运行配置、密钥、日志、模型权重和真实媒体；仅三张有来源与固定哈希的虚构设计 PNG 例外。它不会读取整个被忽略的运行目录，也不能代替发布前人工检查暂存清单和内容。完整验证范围与限制见 [验证说明](docs/VERIFICATION.md)。
+发布校验器读取 Git 索引中已跟踪／暂存的实际对象字节；命令行明确列出的未跟踪候选文件才读取工作区，例如 `python tools/check_public_files.py path/to/new-file.py`。已跟踪文件即使列为候选，仍以索引为准。它拒绝数据库、运行配置、密钥、日志、模型权重和真实媒体；仅三张有来源与固定哈希的虚构设计 PNG 例外。它不会读取整个被忽略的运行目录，也不能代替发布前人工检查暂存清单和内容。完整验证范围与限制见 [验证说明](docs/VERIFICATION.md)。
 
 目前仅准备私有仓库发布；本仓库没有给第三方代码、模型或素材授予公开许可。上传、远端 commit 与可见性须分别核验。
