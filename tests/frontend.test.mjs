@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from '../web/state.js';
+import {mergeShotNotes, splitShotNotes, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot, restoreArchiveFile} from '../web/state.js';
 import {asciiJsonHeader} from '../web/api.js';
 
 test('per-shot motivation and choice preserve unrelated creative notes', () => {
@@ -74,4 +74,46 @@ test('rights header safely round trips Chinese, emoji, quotes and newlines', () 
     const headers = new Headers({'X-Asset-Rights':encoded});
     assert.deepEqual(JSON.parse(headers.get('X-Asset-Rights')), rights);
   }
+});
+
+test('empty-root restore uploads ZIP then selects restored project and episode on reload', async () => {
+  const file = new Blob([new Uint8Array([0x50,0x4b,0x03,0x04])], {type:'application/zip'});
+  const context = {
+    project:null, episode:null, reloaded:false,
+    async reloadProjects(){
+      this.reloaded=true;
+      assert.equal(this.project.id, 'restored-project');
+      assert.equal(this.episode, null);
+      this.project={id:'restored-project',title:'恢复作品'};
+      this.episode={id:'restored-episode',title:'第一集'};
+    }
+  };
+  const result = await restoreArchiveFile(context, file, async (path, options) => {
+    assert.equal(path, '/api/restore');
+    assert.equal(options.method, 'POST');
+    assert.strictEqual(options.body, file);
+    return {project_id:'restored-project',binary_restored:true};
+  });
+  assert.equal(result.project_id, 'restored-project');
+  assert.equal(context.episode.id, 'restored-episode');
+  assert.equal(context.reloaded, true);
+});
+
+test('restore conflict leaves current project selected and surfaces the error', async () => {
+  const current = {id:'current-project'};
+  const context = {project:current,episode:null,reloaded:false,async reloadProjects(){this.reloaded=true;}};
+  const file = new Blob(['PK']);
+  await assert.rejects(() => restoreArchiveFile(context,file,async () => {throw new Error('恢复 ID 已存在');}), /恢复 ID 已存在/);
+  assert.strictEqual(context.project,current);
+  assert.equal(context.reloaded,false);
+  await assert.rejects(() => restoreArchiveFile(context,null,async () => {throw new Error('must not call');}), /选择备份/);
+});
+
+test('project with no episode can switch directly to a restored project', async () => {
+  const context = {project:{id:'draft-without-episode'},episode:null,async reloadProjects(){
+    assert.equal(this.project.id, 'restored-project');
+    this.episode={id:'restored-first-episode'};
+  }};
+  await restoreArchiveFile(context,new Blob(['PK']),async () => ({project_id:'restored-project'}));
+  assert.equal(context.episode.id, 'restored-first-episode');
 });

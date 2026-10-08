@@ -77,3 +77,13 @@ export function timelineOffsetForShot(items, shotId) {
   }
   return null;
 }
+
+export async function restoreArchiveFile(context, file, request) {
+  if (!(file instanceof Blob) || file.size === 0) throw new Error('请先选择备份 ZIP');
+  const restored = await request('/api/restore', {method:'POST', body:file});
+  if (typeof restored?.project_id !== 'string' || !restored.project_id) throw new Error('恢复结果缺少作品信息');
+  context.project = {id:restored.project_id};
+  context.episode = null;
+  await context.reloadProjects();
+  return restored;
+}

@@ -2,6 +2,7 @@ import {api, byId, escapeHtml, option} from './api.js';
 import {setView} from './views.js';
 import {renderShots} from './editor.js';
 import {renderDirector, renderAssets, renderJobs, renderReview, renderExport, renderSettings} from './production.js';
+import {restoreArchiveFile} from './state.js';
 
 const renderers = {director:renderDirector, shots:renderShots, assets:renderAssets, jobs:renderJobs, review:renderReview, export:renderExport, settings:renderSettings};
 const state = {
@@ -39,13 +40,25 @@ const state = {
 };
 
 function renderWelcome(ctx){
-  ctx.el.innerHTML=`<div class="project-prompt"><h1>从一部作品开始</h1><p>建立自己的原创短剧，逐镜记录剧本、素材、选片与成片。<br>也可明确创建一部虚构演示作品熟悉工作台。</p><div class="actions"><button id="welcome-create" class="primary">新建作品</button><button id="welcome-demo">创建“雨夜来客”演示</button></div></div>`;
+  ctx.el.innerHTML=`<div class="project-prompt"><h1>从一部作品开始</h1><p>建立自己的原创短剧，逐镜记录剧本、素材、选片与成片。<br>也可明确创建一部虚构演示作品熟悉工作台。</p><div class="actions"><button id="welcome-create" class="primary">新建作品</button><button id="welcome-demo">创建“雨夜来客”演示</button></div>${restoreControls()}</div>`;
   byId('welcome-create').onclick=()=>openCreate('project');
   byId('welcome-demo').onclick=()=>ctx.run(createDemo);
+  bindRestore(ctx);
 }
 function renderNoEpisode(ctx){
-  ctx.el.innerHTML=`<div class="project-prompt"><h1>${escapeHtml(ctx.project.title)}</h1><p>这部作品还没有分集。先建分集，之后可编写剧本和镜头。</p><button id="welcome-episode" class="primary">新建分集</button></div>`;
+  ctx.el.innerHTML=`<div class="project-prompt"><h1>${escapeHtml(ctx.project.title)}</h1><p>这部作品还没有分集。先建分集，之后可编写剧本和镜头。</p><button id="welcome-episode" class="primary">新建分集</button>${restoreControls()}</div>`;
   byId('welcome-episode').onclick=()=>openCreate('episode');
+  bindRestore(ctx);
+}
+
+function restoreControls(){
+  return `<div class="restore-entry"><label class="field">从镜序备份恢复<input id="welcome-restore-file" type="file" accept=".zip,application/zip"></label><button id="welcome-restore" type="button">恢复备份 ZIP</button><p class="hint">同 ID 的作品会拒绝恢复，不会覆盖已有内容。</p></div>`;
+}
+function bindRestore(ctx){
+  byId('welcome-restore').onclick=()=>ctx.run(async()=>{
+    await restoreArchiveFile(ctx, byId('welcome-restore-file').files[0], api);
+    ctx.notify('备份已恢复，已打开恢复的作品与分集');
+  });
 }
 
 let createKind='project';

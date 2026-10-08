@@ -19,3 +19,4 @@ button{border:1px solid var(--line);border-radius:6px;background:#202b30;padding
 .inspector .actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
 .inspector .actions button{width:100%;min-width:0;white-space:nowrap;padding-inline:10px}
 @media(max-width:380px){.inspector .actions{grid-template-columns:1fr}}
+.restore-entry{max-width:400px;margin:28px auto 0;padding-top:20px;border-top:1px solid var(--line);text-align:left;display:grid;gap:11px}.restore-entry button{justify-self:start}
