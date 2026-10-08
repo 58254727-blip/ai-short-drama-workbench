@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mergeShotNotes, splitShotNotes, readEpisodeExpectation, mergeEpisodeExpectation, readSceneTime, mergeSceneTime, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot, restoreArchiveFile, refreshProjectSelection} from '../web/state.js';
+import {mergeShotNotes, splitShotNotes, readEpisodeExpectation, mergeEpisodeExpectation, mergeEpisodeScriptNotes, readSceneTime, mergeSceneTime, selectLoadableAsrResult, buildTimelineItem, buildCue, formatTime, filterJobs, buildDialogue, parseTranscriptLines, selectReviewContext, timelineOffsetForShot, restoreArchiveFile, refreshProjectSelection} from '../web/state.js';
 import {asciiJsonHeader} from '../web/api.js';
 
 test('per-shot motivation and choice preserve unrelated creative notes', () => {
@@ -25,6 +25,50 @@ test('expectation and scene time can be filled and cleared without erasing other
   assert.equal(readSceneTime(changed, 'scene-a'), '清晨');
   const cleared = mergeSceneTime(mergeEpisodeExpectation(changed, ''), 'scene-a', '');
   assert.equal(cleared, '自由备注\n动机[shot-a]: 找人');
+});
+
+test('indented fullwidth expectation survives an unrelated script save', () => {
+  const original = '  续集期待：门外是谁\n自由备注\n 场景时间[scene-a]：夜';
+  assert.equal(readEpisodeExpectation(original), '门外是谁');
+  assert.equal(readSceneTime(original, 'scene-a'), '夜');
+  const saved = mergeEpisodeScriptNotes(original, '自由备注', readEpisodeExpectation(original));
+  assert.equal(saved, '自由备注\n  续集期待：门外是谁\n 场景时间[scene-a]：夜');
+  assert.equal(mergeEpisodeExpectation(original, '门外是谁'), original);
+  assert.equal(mergeSceneTime(original, 'scene-a', '夜'), original);
+});
+
+test('ASR load accepts current selected video and current audio asset', () => {
+  const shot = {id:'shot-a',episode_id:'episode-a',revision:3,selected_candidate_id:'video-a'};
+  const video = {id:'video-a',project_id:'project-a',kind:'video',sha256:'hash-video',binary_available:true};
+  const audio = {id:'audio-a',project_id:'project-a',kind:'audio',sha256:'hash-audio',binary_available:true};
+  const videoJob = {id:'asr-video',kind:'asr',state:'succeeded',project_id:'project-a',episode_id:'episode-a',shot_id:'shot-a',payload:{asset_id:'video-a',source:'selected_video'},result:{source:'selected_video',source_asset_id:'video-a',source_sha256:'hash-video',shot_revision:3,segments:[{text:'机器线索'}]}};
+  const audioJob = {id:'asr-audio',kind:'asr',state:'succeeded',project_id:'project-a',episode_id:'episode-a',shot_id:'shot-a',payload:{asset_id:'audio-a',source:'audio_asset'},result:{source:'audio_asset',source_asset_id:'audio-a',source_sha256:'hash-audio',shot_revision:3,segments:[{text:'声音线索'}]}};
+  assert.strictEqual(selectLoadableAsrResult([videoJob],shot,[video,audio],'project-a'),videoJob);
+  assert.strictEqual(selectLoadableAsrResult([audioJob],shot,[video,audio],'project-a'),audioJob);
+  assert.strictEqual(selectLoadableAsrResult([videoJob,audioJob],shot,[video,audio],'project-a'),audioJob);
+});
+
+test('ASR load rejects changed hash, missing binary or asset, and stale source or scope', () => {
+  const shot = {id:'shot-a',episode_id:'episode-a',revision:3,selected_candidate_id:'video-a'};
+  const asset = {id:'video-a',project_id:'project-a',kind:'video',sha256:'hash-video',binary_available:true};
+  const job = {id:'asr-video',kind:'asr',state:'succeeded',project_id:'project-a',episode_id:'episode-a',shot_id:'shot-a',payload:{asset_id:'video-a',source:'selected_video'},result:{source:'selected_video',source_asset_id:'video-a',source_sha256:'hash-video',shot_revision:3,segments:[{text:'机器线索'}]}};
+  const choose = (changedJob=job, changedShot=shot, changedAssets=[asset], project='project-a') => selectLoadableAsrResult([changedJob],changedShot,changedAssets,project);
+  assert.equal(choose(job,shot,[{...asset,sha256:'new-hash'}]),null);
+  assert.equal(choose(job,shot,[{...asset,binary_available:false}]),null);
+  assert.equal(choose(job,shot,[]),null);
+  assert.equal(choose({...job,result:{...job.result,source_sha256:undefined}}),null);
+  assert.equal(choose(job,{...shot,selected_candidate_id:'other-video'}),null);
+  assert.equal(choose(job,{...shot,revision:4}),null);
+  assert.equal(choose({...job,payload:{...job.payload,asset_id:'other-video'}}),null);
+  assert.equal(choose({...job,project_id:'foreign-project'}),null);
+  assert.equal(choose(job,shot,[{...asset,project_id:'foreign-project'}]),null);
+  assert.equal(choose({...job,result:{...job.result,source:'old-source'}}),null);
+  const audio = {id:'audio-a',project_id:'project-a',kind:'audio',sha256:'hash-audio',binary_available:true};
+  const audioJob = {...job,payload:{asset_id:'audio-a',source:'audio_asset'},result:{...job.result,source:'audio_asset',source_asset_id:'audio-a',source_sha256:'hash-audio'}};
+  assert.equal(choose(audioJob,shot,[{...audio,sha256:'changed-audio'}]),null);
+  assert.equal(choose(audioJob,shot,[{...audio,binary_available:false}]),null);
+  assert.equal(choose(audioJob,shot,[]),null);
+  assert.equal(choose(audioJob,shot,[{...audio,project_id:'foreign-project'}]),null);
 });
 
 test('actual timeline item uses selected media and nonzero trim', () => {

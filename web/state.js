@@ -21,18 +21,30 @@ export function mergeShotNotes(notes, shotId, motivation, choice) {
   return lines.join('\n');
 }
 
+function labeledLine(line, label) {
+  const stripped = String(line).trimStart();
+  if (!stripped.startsWith(label)) return null;
+  const suffix = stripped.slice(label.length).match(/^([ \t]*[:：][ \t]*)(.*)$/);
+  if (!suffix) return null;
+  return {value:suffix[2].trim(), prefix:line.slice(0, line.length - stripped.length) + label + suffix[1]};
+}
+
 function noteValue(notes, label) {
-  const prefix = label;
   for (const line of String(notes || '').split(/\r?\n/)) {
-    if (line.startsWith(prefix) && /^\s*[:：]/.test(line.slice(prefix.length))) return line.slice(prefix.length).replace(/^\s*[:：]/, '').trim();
+    const parsed = labeledLine(line, label);
+    if (parsed) return parsed.value;
   }
   return '';
 }
 
 function mergeLabelNote(notes, label, value) {
-  const lines = String(notes || '').split(/\r?\n/).filter(line => !(line.startsWith(label) && /^\s*[:：]/.test(line.slice(label.length))));
+  const original = String(notes || '');
+  const parsed = original.split(/\r?\n/).map(line => labeledLine(line, label)).find(Boolean);
+  const next = String(value).trim();
+  if (parsed && next && parsed.value === next) return original;
+  const lines = original.split(/\r?\n/).filter(line => !labeledLine(line, label));
   while (lines.length && !lines.at(-1)) lines.pop();
-  if (String(value).trim()) lines.push(`${label}: ${String(value).trim()}`);
+  if (next) lines.push(`${parsed?.prefix || `${label}: `}${next}`);
   return lines.join('\n');
 }
 
@@ -40,7 +52,29 @@ export const readEpisodeExpectation = notes => noteValue(notes, '续集期待');
 export const mergeEpisodeExpectation = (notes, value) => mergeLabelNote(notes, '续集期待', value);
 export const readSceneTime = (notes, sceneId) => noteValue(notes, `场景时间[${sceneId}]`);
 export const mergeSceneTime = (notes, sceneId, value) => mergeLabelNote(notes, `场景时间[${sceneId}]`, value);
-export const isStructuredNoteLine = line => /^\s*(?:动机|选择|场景时间)\[[^\]]+\]\s*[:：]|^\s*续集期待\s*[:：]/.test(line);
+export const isStructuredNoteLine = line => Boolean(labeledLine(line, '续集期待')) || /^\s*(?:动机|选择|场景时间)\[[^\]]+\]\s*[:：]/.test(line);
+
+export function mergeEpisodeScriptNotes(existing, other, expectation) {
+  const structured = String(existing || '').split(/\r?\n/).filter(isStructuredNoteLine);
+  return mergeEpisodeExpectation([other, ...structured].filter(Boolean).join('\n'), expectation);
+}
+
+export function selectLoadableAsrResult(jobs, shot, assets, projectId) {
+  if (!shot || !projectId) return null;
+  return (jobs || []).filter(job => {
+    const result = job.result;
+    if (job.kind !== 'asr' || job.state !== 'succeeded' || job.project_id !== projectId ||
+        job.episode_id !== shot.episode_id || job.shot_id !== shot.id ||
+        !Array.isArray(result?.segments) || result.shot_revision !== shot.revision) return false;
+    const source = result.source;
+    if (source !== 'selected_video' && source !== 'audio_asset') return false;
+    const asset = (assets || []).find(candidate => candidate.id === result.source_asset_id);
+    if (!asset || asset.project_id !== projectId || asset.binary_available !== true ||
+        !result.source_sha256 || asset.sha256 !== result.source_sha256 ||
+        job.payload?.asset_id !== asset.id || (job.payload.source || 'audio_asset') !== source) return false;
+    return source === 'selected_video' ? asset.kind === 'video' && shot.selected_candidate_id === asset.id : asset.kind === 'audio';
+  }).at(-1) || null;
+}
 
 export function buildTimelineItem(shot, inMs, outMs) {
   if (!shot?.selected_candidate_id) throw new Error('请先为镜头选片');

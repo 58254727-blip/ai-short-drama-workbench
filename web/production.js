@@ -1,6 +1,6 @@
 import {api, asciiJsonHeader, byId, escapeHtml, option, field, area} from './api.js';
 import {heading, section, empty} from './views.js';
-import {splitShotNotes, mergeShotNotes, readEpisodeExpectation, mergeEpisodeExpectation, readSceneTime, mergeSceneTime, isStructuredNoteLine, buildTimelineItem, buildCue, formatTime, filterJobs, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from './state.js';
+import {splitShotNotes, mergeShotNotes, readEpisodeExpectation, mergeEpisodeScriptNotes, readSceneTime, mergeSceneTime, isStructuredNoteLine, selectLoadableAsrResult, buildTimelineItem, buildCue, formatTime, filterJobs, parseTranscriptLines, selectReviewContext, timelineOffsetForShot} from './state.js';
 
 const jobKinds = {h3:'视频生成',text:'文本建议',probe:'媒体核验',asr:'离线语音识别',export:'成片导出'};
 const jobStates = {queued:'待执行',submitting:'提交中',running:'运行中',needs_reconcile:'待核对',succeeded:'技术完成',failed:'失败',cancelled:'已取消'};
@@ -16,8 +16,7 @@ export function renderDirector(ctx) {
   ctx.el.innerHTML = body;
   byId('save-script').onclick = () => ctx.run(async () => {
     const other = byId('episode-notes').value;
-    const structured = ctx.episode.creative_notes.split(/\r?\n/).filter(line => isStructuredNoteLine(line) && !/^\s*续集期待\s*[:：]/.test(line));
-    const merged = mergeEpisodeExpectation([other, ...structured].filter(Boolean).join('\n'), byId('episode-expectation').value);
+    const merged = mergeEpisodeScriptNotes(ctx.episode.creative_notes, other, byId('episode-expectation').value);
     await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:ctx.episode.revision, title:byId('episode-title').value, script:byId('episode-script').value, creative_notes:merged}});
     await ctx.reload(); ctx.notify('剧本已保存');
   });
@@ -33,13 +32,23 @@ export function renderDirector(ctx) {
   byId('save-scene').onclick = () => ctx.run(async () => {
     const sceneId = byId('scene-select').value;
     const payload = {title:byId('scene-title').value || '未命名场景', location:byId('scene-location').value, purpose:byId('scene-purpose').value};
+    let savedSceneId = sceneId;
+    let episodeRevision = ctx.episode.revision;
     if (sceneId) {
       const changed = await api(`/api/episodes/${ctx.episode.id}/scenes/${sceneId}`, {method:'PUT', body:{revision:ctx.episode.revision,...payload}});
-      await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:changed.episode_revision, creative_notes:mergeSceneTime(ctx.episode.creative_notes, sceneId, byId('scene-time').value)}});
+      episodeRevision = changed.episode_revision;
     } else {
       const created = await api(`/api/episodes/${ctx.episode.id}/scenes`, {method:'POST', body:{...payload,sequence:ctx.scenes.length}});
-      ctx.sceneId = created.id;
-      await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:ctx.episode.revision, creative_notes:mergeSceneTime(ctx.episode.creative_notes, created.id, byId('scene-time').value)}});
+      savedSceneId = created.id;
+      ctx.sceneId = savedSceneId;
+    }
+    const updatedNotes = mergeSceneTime(ctx.episode.creative_notes, savedSceneId, byId('scene-time').value);
+    if (updatedNotes !== ctx.episode.creative_notes) {
+      try {
+        await api(`/api/episodes/${ctx.episode.id}`, {method:'PUT', body:{revision:episodeRevision, creative_notes:updatedNotes}});
+      } catch {
+        throw new Error('场景已保存，但场景时间尚未保存。请刷新后重试。');
+      }
     }
     await ctx.reload(); ctx.notify(sceneId ? '场景目标已保存' : '场景已建立');
   });
@@ -127,7 +136,7 @@ export function renderReview(ctx) {
   const {shot, item} = selectReviewContext(ctx.shots, ctx.timeline?.items, ctx.reviewShotId || ctx.shotId);
   const speaker = shot?.dialogue?.[0]?.speaker_id || '';
   const audioAssets = ctx.assets.filter(asset => asset.kind === 'audio' && asset.binary_available);
-  const asrResult = ctx.jobs.filter(job => job.kind === 'asr' && job.shot_id === shot?.id && job.state === 'succeeded' && Array.isArray(job.result?.segments) && job.result?.shot_revision === shot.revision && (job.result?.source !== 'selected_video' || job.result.source_asset_id === shot.selected_candidate_id)).at(-1);
+  const asrResult = selectLoadableAsrResult(ctx.jobs, shot, ctx.assets, ctx.project.id);
   const cueRows = (ctx.cues?.cues || []).map((cue, index) => cueRow(cue, index, ctx)).join('');
   ctx.el.innerHTML = heading('声音与校核', '机器检查与人工审看分别记录。', shot ? `<label class="field">当前镜头<select id="review-shot">${ctx.shots.map((candidate,index)=>option(candidate.id,`${index+1}. ${candidate.story_job || '未命名镜头'}`,candidate.id===shot.id)).join('')}</select></label>` : '') + `<div class="stack">` +
     section('选片人工校核', shot?.selected_candidate_id ? `<div class="stack form-panel"><label class="field">结论<select id="review-verdict"><option value="pass">人工通过</option><option value="revise">需要修改</option><option value="reject">拒绝使用</option></select></label>${area('审看记录','review-note')}<button id="save-review" class="primary">保存人工校核</button><div>${ctx.qc.filter(row=>row.shot_id===shot.id).map(row => `<p class="hint">${escapeHtml(shot.story_job || '镜头')} · ${escapeHtml(row.verdict)} · ${row.current ? '当前版本' : '已过期'} · ${escapeHtml(row.note)}</p>`).join('')}</div></div>` : empty('当前镜头还没有选片', '在分镜中导入并明确选择视频后，再记录人工校核。')) +
@@ -167,10 +176,18 @@ export function renderReview(ctx) {
     await api(`/api/episodes/${ctx.episode.id}/shots/${shot.id}/jobs`,{method:'POST',body:{kind:'asr',payload:{asset_id:audioId,source,plan_revision:1,strategy:'offline-cpu'}}});
     await ctx.reload();ctx.notify('离线语音识别任务已排队，结果需人工对照');
   });
-  if (asrResult && byId('load-asr')) byId('load-asr').onclick = () => {
+  if (asrResult && byId('load-asr')) byId('load-asr').onclick = () => ctx.run(async () => {
+    const [currentShot, currentAsset] = await Promise.all([
+      api(`/api/episodes/${ctx.episode.id}/shots/${shot.id}`),
+      api(`/api/projects/${ctx.project.id}/assets/${asrResult.result.source_asset_id}`)
+    ]);
+    if (!selectLoadableAsrResult([asrResult], currentShot, [currentAsset], ctx.project.id)) {
+      await ctx.reload();
+      throw new Error('识别来源或镜头版本已变化，请重新识别后再载入');
+    }
     byId('actual-transcript').value = asrResult.result.segments.map(line => `${line.speaker_id}：${line.text}`).join('\n');
     ctx.notify('机器识别文本已载入；说话人 unknown 与文字仍需人工听审');
-  };
+  });
   if (ctx.timeline?.status !== 'ready') return;
   if (item) byId('add-cue').onclick = () => {
     const index = byId('cue-rows').children.length;
